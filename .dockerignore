@@ -1,0 +1,8 @@
+*
+!pyproject.toml
+!README.md
+!src
+!src/**
+src/**/__pycache__
+src/**/*.pyc
+**/.DS_Store
