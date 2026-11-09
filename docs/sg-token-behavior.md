@@ -14,7 +14,8 @@ for a first run, start with the [quick start](../README.md#quick-start).
 | User REST token    | Signed-in person's account | REST                      | Hard expiry set by SG       |
 
 A REST bearer token cannot replace a session token in `shotgun_api3`. Neither service gives callers
-the script key or an SG refresh token.
+the script key or an SG refresh token. A session token needs no refresh token: it stays usable for
+as long as it is in use.
 
 ## REST expiry
 
@@ -35,15 +36,14 @@ and a service's cache duration does not impose a hard expiry on the SG session i
 
 The two services report session deadlines differently:
 
-- **App-token broker:** a session's `expires_at` is advisory. It marks when the broker stops
-  reusing its cached session, `defaults.session_ttl_seconds` after minting, and it drives
-  `BrokerClient` caching. It does not tell SG when to invalidate the session.
-- **User-token service:** a session's `expires_at` is null. `cache_until` is only a hint about how
-  long the service may return the same cached session, `SGUT_SESSION_TTL_SECONDS` after minting.
-  `UserTokenClient` does not refresh a session based on `cache_until`.
+| Service            | Session `expires_at`                   | Cache duration                                                            | Client behavior                                                                    |
+| ------------------ | -------------------------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| App-token broker   | Advisory cache deadline, not SG expiry | `defaults.session_ttl_seconds` after minting                              | `BrokerClient` uses `expires_at` to decide when to request another token           |
+| User-token service | Null                                   | `cache_until` hints at reuse for `SGUT_SESSION_TTL_SECONDS` after minting | `UserTokenClient` ignores `cache_until` and keeps the session until forced refresh |
 
-Except for the forced refresh described below, neither service checks with SG before returning a
-cached token, so a cached token can already be unusable, for example after an account is disabled.
+Except for the forced user-session refresh described below, neither service checks with SG before
+returning a cached token, so a cached token can already be unusable, for example after an account
+is disabled.
 
 ### Renewing a rejected user session
 
@@ -51,6 +51,14 @@ When SG rejects a user session, call `fetch_token('session', force_refresh=True)
 `sg-token-broker get-user-token --force-refresh`. The service checks its cached session with SG and
 replaces it only if SG rejects it. If the service has no live cached entry, it mints a replacement
 directly. Recreate the consuming SG client with the returned token.
+
+### Replacing a rejected app token
+
+When SG rejects an app token before its `expires_at`, call
+`BrokerClient.fetch_token(scope, token_type, force_refresh=True)`. The client discards its cached
+token and asks the broker again. The broker does not check its own cache with SG: it can return the
+same REST token for up to 60 seconds after minting it, and the same session for
+`defaults.session_ttl_seconds`. If the returned token is the one SG rejected, wait before retrying.
 
 ## Revocation
 
@@ -66,10 +74,10 @@ account suspends them, but restoring the same account can make them usable again
 To retire a compromised account's sessions, rotate its key, rename the account, trash it and leave
 it trashed, then create a replacement account with the original name and a fresh key. Follow the
 [full recovery procedure](deployment.md#retire-a-compromised-script-account), which includes
-service and client cache handling. Renaming alone is not an established revocation mechanism.
+service and client cache handling. Do not rely on renaming alone to revoke a token.
 
-The effect of disabling the source script account on outstanding REST tokens has not been
-established. Plan for those tokens to remain usable until their hard expiry.
+For outstanding app REST tokens, plan for use until hard expiry even after disabling the source
+script account. Do not rely on that action to revoke them.
 
 ### Human-account tokens
 
@@ -77,32 +85,25 @@ Disabling the person's SG account rejects new user-bound tokens and suspends out
 REST and session tokens. The service may still return a cached token, but SG rejects its use while
 the account is disabled.
 
-| Account state                          | Outstanding REST token                   | Outstanding session token                 |
-| -------------------------------------- | ---------------------------------------- | ----------------------------------------- |
-| Disabled                               | Rejected                                 | Rejected                                  |
-| Restored before the REST token expires | May work again until the original expiry | Restore behavior has not been established |
-| Restored after the REST token expires  | Remains expired                          | Restore behavior has not been established |
+Restoring an account before a REST token expires can make that token usable again until its
+original expiry. A REST token that has expired stays expired. Do not rely on disabling and
+restoring an account to retire its old sessions.
 
 For permanent offboarding, leave the SG account disabled and revoke the person's access to the
 token service. If you restore an account after a REST-token incident, first wait out the
 outstanding tokens' full SG lifetime. The service's earlier cache expiry is not the SG revocation
 boundary.
 
-## Limits of the supported behavior
+## Supported authentication paths
 
-This guidance comes from limited testing against SG, not a guarantee for every site configuration
-or future Autodesk release. Recheck critical revocation assumptions after material SG
-authentication changes. In particular:
+Use the [app-token broker or user-token service](modes.md) to obtain session or REST tokens. Legacy
+human-account password or personal access token authentication, and converting a session token
+through a REST grant, are outside this project's supported authentication paths.
 
-- How old user sessions behave after the account is disabled and restored has not been established.
-- Disabling a source script account has not been established as a way to revoke REST tokens.
-- User permission binding has not been exhaustively checked for every field, conditional rule,
-  entity, and create, read, update, or delete operation.
-- Legacy password or personal access token authentication for human accounts, and converting a
-  session token through a REST grant, are outside the behavior this project has established.
-
-The [revocation check](deployment.md#verify-revocation-behavior-on-a-trial-site) uses a disposable
-script account so that you can test your own site's behavior.
+For account recovery, the
+[revocation check](deployment.md#verify-revocation-behavior-on-a-trial-site) lets an administrator
+check a site's behavior with a disposable script account. Use it after material SG authentication
+changes.
 
 ## Upstream references
 

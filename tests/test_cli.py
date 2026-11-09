@@ -1,6 +1,7 @@
 import argparse
 import base64
 import datetime
+import getpass
 import importlib.metadata
 import io
 import json
@@ -8,6 +9,7 @@ import logging
 import os
 import ssl
 import sys
+import warnings
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import NoReturn, TextIO, cast
@@ -24,16 +26,18 @@ from sg_token_broker._googleverify import VerifierUnavailableError
 from sg_token_broker._oidcverify import OidcUnavailableError
 from sg_token_broker._secrets import verify_secret
 from sg_token_broker._sg import MintedToken, SGError
-from sg_token_broker._userauth import _GOOGLE_TOKEN_ENDPOINT, SignInError, TokenBundle
+from sg_token_broker._userauth import SignInError, _TokenBundle
 from sg_token_broker._userclient import UserToken, UserTokenClientError
 from tests.cli_helpers import invoke_cli
-from tests.conftest import BROKER_CREDENTIAL, _FakeSG
+from tests.conftest import BROKER_CREDENTIAL, FakeSG
 
 # Precomputed valid hash of 'x' for configuration setup.
 _CONFIG_HASH = (
     'scrypt$16384$8$1$40vcdl7AgTzLmOGl+anfBQ==$'
     'wL+YRQJWbt9/zf6Wpcl3nDff4/OkYaw7LIU04aIrjpqBs/boSojdqPdZXy8s3oZxk/CJN5/VcQy138851oY/sw=='
 )
+# Stored Google sign-ins live under this keyring issuer; changing it orphans them.
+_GOOGLE_KEYRING_ISSUER = 'https://oauth2.googleapis.com/token'
 _ID_TOKEN = (
     'e30.'
     + base64.urlsafe_b64encode(json.dumps({'email': 'jane@s.example', 'nonce': 'n'}).encode())
@@ -41,7 +45,7 @@ _ID_TOKEN = (
     .decode()
     + '.x'
 )
-VALID_COMMAND_ARGUMENTS = ['hash-secret']
+_VALID_COMMAND_ARGUMENTS = ['hash-secret']
 
 
 class TestCheckConfig:
@@ -198,7 +202,7 @@ class TestGetToken:
     def test_prints_token_json(
         self,
         broker_url: str,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -207,7 +211,7 @@ class TestGetToken:
         monkeypatch.setenv('SG_TOKEN_BROKER_CLIENT_SECRET', BROKER_CREDENTIAL)
         assert main(['get-token', '--scope', 'read_all']) == 0
         body = json.loads(capsys.readouterr().out)
-        assert body['token'] == fake_sg._canned_session
+        assert body['token'] == fake_sg.canned_session
 
     def test_refused_request_is_a_runtime_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(cli_module, 'BrokerClient', _RefusingBrokerClient)
@@ -302,25 +306,70 @@ class TestGetUserToken:
 
 
 class TestHashSecret:
-    @pytest.mark.parametrize('secret', ['', 'café', 'has space'])
-    def test_hash_secret_rejects_bad_grammar(self, secret: str) -> None:
-        assert invoke_cli(['hash-secret', '--secret', secret]) == (
-            2,
-            '',
-            'error: secret must be non-empty printable ASCII with no spaces\n',
+    def test_hashes_stdin_secret_without_echo(self) -> None:
+        status, stdout, stderr = invoke_cli(
+            ['hash-secret', '--secret'], stdin=f'{BROKER_CREDENTIAL}\nignored\n'
         )
+        assert (status, stderr) == (0, '')
+        assert stdout.startswith('hash: ')
+        assert stdout.count('\n') == 1
+        assert BROKER_CREDENTIAL not in stdout
+        assert verify_secret(BROKER_CREDENTIAL, stdout.removeprefix('hash: ').removesuffix('\n'))
 
-    def test_hashes_provided_secret(self, capsys: pytest.CaptureFixture[str]) -> None:
-        assert main(['hash-secret', '--secret', BROKER_CREDENTIAL]) == 0
-        lines = dict(line.split(': ', 1) for line in capsys.readouterr().out.strip().splitlines())
-        assert lines['secret'] == BROKER_CREDENTIAL
-        assert verify_secret(BROKER_CREDENTIAL, lines['hash'])
+    def test_hashes_terminal_secret_without_echo(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        prompt = Mock(return_value=BROKER_CREDENTIAL)
+        monkeypatch.setattr(cli_module.sys, 'stdin', Mock(isatty=lambda: True))
+        monkeypatch.setattr(cli_module.getpass, 'getpass', prompt)
+        assert main(['hash-secret', '--secret']) == 0
+        captured = capsys.readouterr()
+        prompt.assert_called_once_with('secret: ')
+        assert captured.err == ''
+        assert captured.out.startswith('hash: ')
+        assert captured.out.count('\n') == 1
+        assert BROKER_CREDENTIAL not in captured.out
+        assert verify_secret(
+            BROKER_CREDENTIAL, captured.out.removeprefix('hash: ').removesuffix('\n')
+        )
 
     def test_outputs_secret_and_hash(self, capsys: pytest.CaptureFixture[str]) -> None:
         assert main(['hash-secret']) == 0
         out = capsys.readouterr().out
         lines = dict(line.split(': ', 1) for line in out.strip().splitlines())
         assert verify_secret(lines['secret'], lines['hash'])
+
+    @pytest.mark.parametrize('secret', ['', 'café', 'has space'])
+    def test_stdin_secret_rejects_bad_grammar(self, secret: str) -> None:
+        assert invoke_cli(['hash-secret', '--secret'], stdin=f'{secret}\n') == (
+            2,
+            '',
+            'error: secret must be non-empty printable ASCII with no spaces\n',
+        )
+
+    def test_terminal_echo_warning_rejects_before_fallback_read(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        fallback_read = Mock(return_value=BROKER_CREDENTIAL)
+        terminal_input = Mock()
+        terminal_input.isatty.return_value = True
+        terminal_input.readline.side_effect = AssertionError('unexpected standard-input read')
+
+        def warn_then_fallback(prompt: str) -> str:
+            assert prompt == 'secret: '
+            warnings.warn('cannot control terminal echo', getpass.GetPassWarning, stacklevel=2)
+            return fallback_read()
+
+        monkeypatch.setattr(cli_module.sys, 'stdin', terminal_input)
+        monkeypatch.setattr(cli_module.getpass, 'getpass', warn_then_fallback)
+        assert main(['hash-secret', '--secret']) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        assert captured.err == (
+            'error: cannot hide the secret on this terminal; pipe it on standard input instead\n'
+        )
+        fallback_read.assert_not_called()
+        terminal_input.readline.assert_not_called()
 
 
 @pytest.mark.usefixtures('isolate_identity_environment')
@@ -370,8 +419,60 @@ class TestLogin:
             'store_refresh_token',
             store,
         )
-        assert main(['login', '--no-store']) == 0
+        assert invoke_cli(['login', '--no-store']) == (
+            0,
+            'signed in as jane@s.example (credential not stored)\n',
+            '',
+        )
         assert called == []
+
+    def test_login_passes_the_configured_client_secret(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv('SG_USER_TOKEN_CLIENT_ID', 'client-1')
+        monkeypatch.setenv('SG_USER_TOKEN_CLIENT_SECRET', 'secret-1')
+        sign_in = Mock(side_effect=_fake_sign_in)
+        monkeypatch.setattr(cli_module, 'sign_in', sign_in)
+
+        assert invoke_cli(['login', '--no-store'])[0] == 0
+        assert [sign_in.call_args.kwargs['client_secret']] == ['secret-1']
+
+    def test_login_reports_when_provider_issues_no_refresh_credential(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv('SG_USER_TOKEN_CLIENT_ID', 'client-1')
+
+        def sign_in_without_refresh(_client_id: str, **_kwargs: object) -> _TokenBundle:
+            return _TokenBundle(id_token=_ID_TOKEN, refresh_token=None)
+
+        monkeypatch.setattr(cli_module, 'sign_in', sign_in_without_refresh)
+        store = Mock(side_effect=AssertionError('no credential to store'))
+        monkeypatch.setattr(cli_module, 'store_refresh_token', store)
+        assert invoke_cli(['login']) == (
+            0,
+            (
+                'signed in as jane@s.example '
+                '(credential not stored: the provider issued no refresh credential)\n'
+            ),
+            '',
+        )
+        store.assert_not_called()
+
+    def test_login_reports_when_storage_is_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv('SG_USER_TOKEN_CLIENT_ID', 'client-1')
+        monkeypatch.setattr(cli_module, 'sign_in', _fake_sign_in)
+        monkeypatch.setattr(cli_module, 'store_refresh_token', _store_false)
+        assert invoke_cli(['login']) == (
+            0,
+            (
+                'signed in as jane@s.example '
+                '(credential not stored: install sg-token-broker[login] or use a supported '
+                'keyring)\n'
+            ),
+            '',
+        )
 
     def test_login_stores_refresh_token_and_account_pointer(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -406,9 +507,9 @@ class TestLogin:
             point,
         )
         assert main(['login']) == 0
-        assert stored == [(_GOOGLE_TOKEN_ENDPOINT, 'client-1', 'jane@s.example', 'rt-1')]
-        assert pointed == [(_GOOGLE_TOKEN_ENDPOINT, 'client-1', 'jane@s.example')]
-        assert 'signed in as jane@s.example' in capsys.readouterr().out
+        assert stored == [(_GOOGLE_KEYRING_ISSUER, 'client-1', 'jane@s.example', 'rt-1')]
+        assert pointed == [(_GOOGLE_KEYRING_ISSUER, 'client-1', 'jane@s.example')]
+        assert capsys.readouterr().out == 'signed in as jane@s.example\n'
 
     def test_login_warns_when_the_pointer_cannot_be_saved(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -467,8 +568,8 @@ class TestLogout:
             drop_pointer,
         )
         assert main(['logout']) == 0
-        assert dropped == [(_GOOGLE_TOKEN_ENDPOINT, 'client-1', 'jane@s.example')]
-        assert pointer_dropped == [(_GOOGLE_TOKEN_ENDPOINT, 'client-1')]
+        assert dropped == [(_GOOGLE_KEYRING_ISSUER, 'client-1', 'jane@s.example')]
+        assert pointer_dropped == [(_GOOGLE_KEYRING_ISSUER, 'client-1')]
 
     def test_logout_failure_keeps_pointer_and_reports_error(
         self,
@@ -524,7 +625,7 @@ class TestLogout:
             drop_pointer,
         )
         assert main(['logout']) == 0
-        assert dropped == [(_GOOGLE_TOKEN_ENDPOINT, 'client-1', 'bob@s.example')]
+        assert dropped == [(_GOOGLE_KEYRING_ISSUER, 'client-1', 'bob@s.example')]
         assert pointer_dropped == []
 
     def test_logout_pointer_failure_reports_partial_error(
@@ -566,7 +667,7 @@ class TestLogout:
         monkeypatch.setattr(cli_module, 'delete_refresh_token', delete)
         monkeypatch.setattr(cli_module, 'delete_account', delete)
         assert main(['logout']) == 0
-        assert deleted[0] == (_GOOGLE_TOKEN_ENDPOINT, 'client-1', 'jane@s.example')
+        assert deleted[0] == (_GOOGLE_KEYRING_ISSUER, 'client-1', 'jane@s.example')
 
     def test_missing_account_is_a_negative_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv('SG_USER_TOKEN_CLIENT_ID', 'client-1')
@@ -874,7 +975,7 @@ class TestVerifyRevocation:
 
     def test_mid_flow_upstream_fault_is_setup_error(
         self,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -882,7 +983,7 @@ class TestVerifyRevocation:
 
         def fake_input(prompt: str) -> str:
             del prompt
-            fake_sg._rpc_fault = True
+            fake_sg.rpc_fault = True
             return ''
 
         monkeypatch.setattr('builtins.input', fake_input)
@@ -890,7 +991,7 @@ class TestVerifyRevocation:
             [
                 'verify-revocation',
                 '--site-url',
-                fake_sg._url,
+                fake_sg.url,
                 '--script-name',
                 'broker_read_all',
                 '--script-key-env',
@@ -944,7 +1045,7 @@ class TestVerifyRevocation:
 
     def test_remote_http_is_rejected_without_request(
         self,
-        fake_sg: _FakeSG,
+        offline_sg: FakeSG,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setenv('SGTB_VERIFY_KEY', 'masterkey')
@@ -958,15 +1059,14 @@ class TestVerifyRevocation:
                 '--script-key-env',
                 'SGTB_VERIFY_KEY',
                 '--proxy',
-                fake_sg._url,
+                offline_sg.url,
             ]
         )
         assert result == 2
-        assert fake_sg._requests == []
 
     def test_runs_full_flow(
         self,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -974,8 +1074,8 @@ class TestVerifyRevocation:
 
         def fake_input(prompt: str) -> str:
             del prompt
-            fake_sg._fail_rpc = True
-            fake_sg._session_revoked = True
+            fake_sg.fail_rpc = True
+            fake_sg.session_revoked = True
             return ''
 
         monkeypatch.setattr('builtins.input', fake_input)
@@ -983,7 +1083,7 @@ class TestVerifyRevocation:
             [
                 'verify-revocation',
                 '--site-url',
-                fake_sg._url,
+                fake_sg.url,
                 '--script-name',
                 'broker_read_all',
                 '--script-key-env',
@@ -1022,7 +1122,7 @@ class TestVerifyRevocation:
 class TestVerifyRevocationProxy:
     def test_proxy_is_used(
         self,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setenv('SGTB_VERIFY_KEY', 'k')
@@ -1036,11 +1136,11 @@ class TestVerifyRevocationProxy:
                 '--script-key-env',
                 'SGTB_VERIFY_KEY',
                 '--proxy',
-                fake_sg._url,
+                fake_sg.url,
             ]
         )
         assert result == 2
-        proxied = [str(r['path']) for r in fake_sg._requests]
+        proxied = [str(r['path']) for r in fake_sg.requests]
         assert any(p.startswith('http://127.0.0.1:9') for p in proxied)
 
 
@@ -1061,8 +1161,8 @@ class _RefusingBrokerClient:
         raise BrokerClientError('broker refused (HTTP 401): invalid client credentials')
 
 
-def _fake_sign_in(_client_id: str, **_kwargs: object) -> TokenBundle:
-    return TokenBundle(
+def _fake_sign_in(_client_id: str, **_kwargs: object) -> _TokenBundle:
+    return _TokenBundle(
         id_token=_ID_TOKEN,
         refresh_token='rt-1',  # noqa: S106 - fake credential
     )
@@ -1179,6 +1279,7 @@ def _write_config(
 @pytest.fixture
 def isolate_identity_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv('SG_USER_TOKEN_CLIENT_ID', raising=False)
+    monkeypatch.delenv('SG_USER_TOKEN_CLIENT_SECRET', raising=False)
     monkeypatch.delenv('SG_USER_TOKEN_ISSUER', raising=False)
     monkeypatch.delenv('SG_USER_TOKEN_EMAIL_CLAIM', raising=False)
     monkeypatch.delenv('SG_USER_TOKEN_ACCOUNT', raising=False)
@@ -1306,6 +1407,26 @@ def test_subcommand_options_are_grouped_only_by_kind(command: str, headings: lis
     ] == headings
 
 
+@pytest.mark.parametrize('kind', ['readable', 'directory', 'unreadable'])
+def test_ca_bundle_requires_a_readable_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    bundle = tmp_path / 'ca.pem'
+    if kind == 'directory':
+        bundle.mkdir()
+    else:
+        bundle.write_bytes(b'certificate data')
+    if kind == 'unreadable':
+        monkeypatch.setattr(Path, 'open', Mock(side_effect=PermissionError('denied')))
+    module = cli_module
+    if kind == 'readable':
+        assert module._readable_ca_bundle(str(bundle)) == str(bundle)
+    else:
+        with pytest.raises(argparse.ArgumentTypeError) as caught:
+            module._readable_ca_bundle(str(bundle))
+        assert str(caught.value) == f'no readable CA bundle at {bundle}'
+
+
 def test_unavailable_stdout_is_an_error(capsys: pytest.CaptureFixture[str]) -> None:
     # Restore stdout before capsys finalizes, so its capture stream is not reinstated.
     with pytest.MonkeyPatch.context() as patch:
@@ -1325,9 +1446,26 @@ def test_verify_revocation_help_states_its_exit_statuses() -> None:
     )
 
 
+def test_verify_revocation_missing_ca_bundle_is_a_usage_error(tmp_path: Path) -> None:
+    missing = tmp_path / 'missing-ca.pem'
+    status, _, stderr = invoke_cli(
+        [
+            'verify-revocation',
+            '--site-url',
+            'https://127.0.0.1:1',
+            '--script-name',
+            's',
+            '--ca-bundle',
+            str(missing),
+        ]
+    )
+    assert status == 2
+    assert f'no readable CA bundle at {missing}' in stderr
+
+
 def test_version_ignores_other_valid_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(importlib.metadata, 'version', _fixed_version)
-    assert invoke_cli(['--version', *VALID_COMMAND_ARGUMENTS]) == (
+    assert invoke_cli(['--version', *_VALID_COMMAND_ARGUMENTS]) == (
         0,
         'sg-token-broker 9.8.7\n',
         '',

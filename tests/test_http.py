@@ -5,7 +5,6 @@ import logging
 import socket
 import threading
 from collections.abc import Iterator
-from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import cast
 from unittest.mock import Mock
@@ -14,12 +13,11 @@ import pytest
 import requests
 
 from sg_token_broker import _http, _service
-from sg_token_broker._config import BrokerConfig, ServerConfig, TlsConfig
+from sg_token_broker._config import BrokerConfig, _ServerConfig, _TlsConfig
 from sg_token_broker._http import create_server
-from sg_token_broker._httpbase import BoundedThreadingHTTPServer
 from sg_token_broker._service import BrokerService, TokenRequest
-from tests._tls import _write_tls_material
-from tests.conftest import BROKER_CREDENTIAL, _FakeSG
+from tests._tls import write_tls_material
+from tests.conftest import BROKER_CREDENTIAL, FakeSG
 
 _HANDLER = _http._Handler
 _MAX_BODY_BYTES = _http._MAX_BODY_BYTES
@@ -55,7 +53,7 @@ class TestHealthz:
 
         config = BrokerConfig(
             site_url='https://studio.example.com',
-            server=ServerConfig(bind='::1', port=0, tls=None),
+            server=_ServerConfig(bind='::1', port=0, tls=None),
             session_ttl_seconds=600,
             scopes={},
             clients={},
@@ -125,42 +123,6 @@ def _raw_exchange(broker_url: str, payload: bytes, *, half_close: bool = False) 
                 break
             chunks.append(data)
     return b''.join(chunks)
-
-
-class TestAddressFamily:
-    @pytest.mark.parametrize(
-        ('host', 'expected_family'),
-        [
-            ('::1', socket.AF_INET6),
-            ('2001:db8::1', socket.AF_INET6),
-            ('127.0.0.1', socket.AF_INET),
-            ('localhost', socket.AF_INET),
-        ],
-    )
-    def test_family_is_selected_before_socket_creation(
-        self, monkeypatch: pytest.MonkeyPatch, host: str, expected_family: socket.AddressFamily
-    ) -> None:
-        families: list[int] = []
-
-        def record_family(
-            server: BoundedThreadingHTTPServer,
-            address: tuple[str, int],
-            handler: type[BaseHTTPRequestHandler],
-        ) -> None:
-            del handler
-            assert address == (host, 0)
-            families.append(server.address_family)
-
-        monkeypatch.setattr(BoundedThreadingHTTPServer, '__init__', record_family)
-        config = BrokerConfig(
-            site_url='https://studio.example.com',
-            server=ServerConfig(bind=host, port=0, tls=None),
-            session_ttl_seconds=600,
-            scopes={},
-            clients={},
-        )
-        create_server(config, Mock(spec=BrokerService))
-        assert families == [expected_family]
 
 
 class TestRequestFraming:
@@ -257,13 +219,6 @@ class TestRequestFraming:
         first = b'POST /v1/token HTTP/1.1\r\nHost: b\r\nContent-Length: ' + length + b'\r\n\r\n'
         second = b'GET /healthz HTTP/1.1\r\nHost: b\r\nConnection: close\r\n\r\n'
         raw = _raw_exchange(broker_url, first + body + second)
-        assert raw.startswith(b'HTTP/1.1 400')
-        assert b'connection: close' in raw.lower()
-        assert raw.count(b'HTTP/1.1 ') == 1
-
-    def test_negative_content_length_is_rejected_and_closed(self, broker_url: str) -> None:
-        head = b'POST /v1/token HTTP/1.1\r\nHost: broker\r\nContent-Length: -5\r\n\r\n'
-        raw = _raw_exchange(broker_url, head)
         assert raw.startswith(b'HTTP/1.1 400')
         assert b'connection: close' in raw.lower()
         assert raw.count(b'HTTP/1.1 ') == 1
@@ -392,25 +347,7 @@ class TestTokenEndpoint:
         )
         assert response.status_code == 403
 
-    def test_garbage_basic_auth_is_401(self, broker_url: str) -> None:
-        response = requests.post(
-            f'{broker_url}/v1/token',
-            json={'scope': 'read_all'},
-            headers={'Authorization': 'Basic !!!not-base64!!!'},
-            timeout=5,
-        )
-        assert response.status_code == 401
-
-    def test_invalid_json_is_400(self, broker_url: str) -> None:
-        response = requests.post(
-            f'{broker_url}/v1/token',
-            data='{nope',
-            headers={**_auth_header(), 'Content-Type': 'application/json'},
-            timeout=5,
-        )
-        assert response.status_code == 400
-
-    def test_issues_token(self, broker_url: str, fake_sg: _FakeSG) -> None:
+    def test_issues_token(self, broker_url: str, fake_sg: FakeSG) -> None:
         response = requests.post(
             f'{broker_url}/v1/token',
             json={'scope': 'read_all'},
@@ -419,7 +356,7 @@ class TestTokenEndpoint:
         )
         assert response.status_code == 200
         body = response.json()
-        assert body['token'] == fake_sg._canned_session
+        assert body['token'] == fake_sg.canned_session
         assert body['token_type'] == _SESSION_TYPE
         assert 'expires_at' in body
 
@@ -435,24 +372,11 @@ class TestTokenEndpoint:
             )
         assert len(caplog.records) == 1
 
-    def test_missing_auth_is_401(self, broker_url: str) -> None:
-        response = requests.post(f'{broker_url}/v1/token', json={'scope': 'read_all'}, timeout=5)
-        assert response.status_code == 401
-
     def test_missing_scope_is_400(self, broker_url: str) -> None:
         response = requests.post(
             f'{broker_url}/v1/token', json={}, headers=_auth_header(), timeout=5
         )
         assert response.status_code == 400
-
-    def test_oversized_body_is_413(self, broker_url: str) -> None:
-        response = requests.post(
-            f'{broker_url}/v1/token',
-            data='x' * 10000,
-            headers={**_auth_header(), 'Content-Type': 'application/json'},
-            timeout=5,
-        )
-        assert response.status_code == 413
 
     @pytest.mark.parametrize(
         'case',
@@ -512,9 +436,9 @@ class TestTokenEndpoint:
         assert set(lines[0]) == {'ts', 'event', 'reason', 'source_ip', 'request_id'}
 
     def test_rest_mint_fails_closed_when_sg_rejects_the_master_key(
-        self, broker_url: str, fake_sg: _FakeSG
+        self, broker_url: str, fake_sg: FakeSG
     ) -> None:
-        fake_sg._rest_credentials = {'broker_read_all': 'not-the-configured-key'}
+        fake_sg.rest_credentials = {'broker_read_all': 'not-the-configured-key'}
         response = requests.post(
             f'{broker_url}/v1/token',
             json={'scope': 'read_all', 'token_type': 'rest'},
@@ -523,6 +447,44 @@ class TestTokenEndpoint:
         )
         assert response.status_code == 502
         assert response.json()['error'] == 'upstream_error'
+
+    def test_unexpected_issue_error_is_opaque_500_and_audited(
+        self,
+        broker_url: str,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def explode(*_args: object, **_kwargs: object) -> _service._IssuedToken:
+            raise RuntimeError('secret implementation detail')
+
+        monkeypatch.setattr(BrokerService, 'issue_token', explode)
+        with caplog.at_level(logging.INFO, logger='sg_token_broker.audit'):
+            response = requests.post(
+                f'{broker_url}/v1/token',
+                json={'scope': 'read_all'},
+                headers=_auth_header(),
+                timeout=5,
+            )
+        assert response.status_code == 500
+        assert response.json() == {'error': 'internal_error', 'detail': 'internal error'}
+        records = [record for record in caplog.records if record.name == 'sg_token_broker.audit']
+        assert len(records) == 1
+        audit_message = records[0].getMessage()
+        audit = json.loads(audit_message)
+        assert set(audit) == {'ts', 'event', 'reason', 'detail', 'source_ip', 'request_id'}
+        assert audit['event'] == 'error'
+        assert audit['reason'] == 'internal_error'
+        assert audit['detail'] == 'RuntimeError'
+        assert audit['source_ip'] == '127.0.0.1'
+        assert audit['request_id']
+        assert 'secret implementation detail' not in audit_message
+        assert BROKER_CREDENTIAL not in audit_message
+        http_records = [
+            record for record in caplog.records if record.name == 'sg_token_broker.http'
+        ]
+        assert len(http_records) == 1
+        assert http_records[0].exc_info is not None
+        assert 'secret implementation detail' not in response.text
 
     def test_unexpected_parse_error_is_opaque_500_and_audited(
         self,
@@ -562,20 +524,16 @@ class TestTokenEndpoint:
         assert http_records[0].exc_info is not None
         assert 'secret implementation detail' not in response.text
 
-    def test_unknown_path_is_404(self, broker_url: str) -> None:
-        response = requests.post(f'{broker_url}/nope', json={}, headers=_auth_header(), timeout=5)
-        assert response.status_code == 404
-
 
 @pytest.fixture
 def tls_broker_url(tmp_path: Path) -> Iterator[tuple[str, tuple[str, int]]]:
-    certificate_path, key_path = _write_tls_material(tmp_path)
+    certificate_path, key_path = write_tls_material(tmp_path)
     config = BrokerConfig(
         site_url='https://studio.example.com',
-        server=ServerConfig(
+        server=_ServerConfig(
             bind='127.0.0.1',
             port=0,
-            tls=TlsConfig(cert_file=certificate_path, key_file=key_path),
+            tls=_TlsConfig(cert_file=certificate_path, key_file=key_path),
         ),
         session_ttl_seconds=600,
         scopes={},

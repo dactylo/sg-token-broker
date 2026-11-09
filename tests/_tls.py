@@ -8,7 +8,7 @@ from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1, generate_pri
 from cryptography.x509.oid import NameOID
 
 
-def _write_tls_material(directory: Path) -> tuple[Path, Path]:  # pyright: ignore[reportUnusedFunction]
+def write_tls_material(directory: Path) -> tuple[Path, Path]:
     key = generate_private_key(SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, '127.0.0.1')])
     now = datetime.datetime.now(datetime.UTC)

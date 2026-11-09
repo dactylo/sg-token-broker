@@ -23,7 +23,11 @@ class _Handler(BaseHTTPRequestHandler):
     """Single route: echo the edge-verified caller's claims as JSON."""
 
     def do_GET(self) -> None:
-        """Respond with the claims of the edge-verified caller."""
+        """Respond with the claims of the edge-verified caller.
+
+        Raises:
+            OSError: If the HTTP response cannot be written.
+        """
         claims = _decode_claims_unverified(self.headers.get('Authorization', ''))
         body = json.dumps({'ok': bool(claims), 'claims': claims}).encode()
         self.send_response(200)
@@ -52,11 +56,11 @@ def _decode_claims_unverified(authorization: str) -> dict[str, object]:
     return {key: claims.get(key) for key in _ECHOED_CLAIMS}
 
 
-def main() -> None:
+def _main() -> None:
     """Serve on all interfaces using `$PORT`, defaulting to 8080, until terminated."""
     port = int(os.environ.get('PORT', '8080'))
     ThreadingHTTPServer(('', port), _Handler).serve_forever()
 
 
 if __name__ == '__main__':
-    main()
+    _main()

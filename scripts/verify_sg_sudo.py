@@ -16,15 +16,13 @@ Usage:
     python verify_sg_sudo.py --site-url https://studio.shotgunstudio.com
         --script-name sudo_capable_script --script-key-env SGTB_VERIFY_KEY
         --sudo-login some.testuser
-        --proxy http://squid:8080 --ca-bundle /path/to/corp-root-ca.pem
+        --proxy http://proxy.example:3128 --ca-bundle /path/to/corp-root-ca.pem
     (single command line; wrapped here for readability)
 
 Exit codes: 0 = the disabled-user check was conclusive (read the other printed
 results), 2 = setup error, 3 = the disabled-user check was inconclusive because
 ordinary expiry could not be ruled out or SG did not answer cleanly.
 """
-
-# pyright: reportPrivateUsage=false
 
 import argparse
 import getpass
@@ -35,6 +33,7 @@ import time
 import warnings
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
 
@@ -56,12 +55,12 @@ _TIMEOUT_SECONDS = 15.0
 class _SurveyContext:
     """Carry shared state for the sudo verification survey."""
 
-    _session: requests.Session
-    _site_url: str
-    _script_name: str
-    _key: str
-    _sudo_login: str
-    _clock: Callable[[], float]
+    session: requests.Session
+    site_url: str
+    script_name: str
+    key: str
+    sudo_login: str
+    clock: Callable[[], float]
 
 
 def _build_session(
@@ -92,6 +91,8 @@ def _count_projects(
         )
     except requests.RequestException as exc:
         raise RuntimeError(f'cannot reach SG site: {exc.__class__.__name__}: {exc}') from exc
+    except OSError as exc:
+        raise RuntimeError(f'cannot send the SG request: {exc}') from exc
     if response.status_code != _HTTP_OK:
         return None, response.status_code
     try:
@@ -116,7 +117,7 @@ def _check_disabled_user(
 ) -> str:
     """Check sudo tokens while the test user is disabled and after re-enabling."""
     input(
-        f'Step: Disable the test user {context._sudo_login!r} in SG (Admin > People, uncheck '
+        f'Step: Disable the test user {context.sudo_login!r} in SG (Admin > People, uncheck '
         'active / set status), then press Enter... '
     )
     disabled_result = 'INCONCLUSIVE'
@@ -131,8 +132,8 @@ def _check_disabled_user(
                 f'Inconclusive: the sudo remint failed with HTTP {status}, which is not a clean '
                 f'rejection ({error}).'
             )
-        count, status = _count_projects(context._session, context._site_url, sudo_token)
-        elapsed = context._clock() - minted_at
+        count, status = _count_projects(context.session, context.site_url, sudo_token)
+        elapsed = context.clock() - minted_at
         window = f'elapsed {elapsed:.0f}s of a {expires_in}s lifetime'
         if count is not None:
             disabled_result = 'SURVIVED'
@@ -160,8 +161,8 @@ def _check_disabled_user(
                 f'Inconclusive: the sudo-token project query failed with HTTP {status} '
                 f'({window}); cannot distinguish revocation from an outage.'
             )
-        input(f'Step: Re-enable the test user {context._sudo_login!r}, then press Enter... ')
-        count, status = _count_projects(context._session, context._site_url, sudo_token)
+        input(f'Step: Re-enable the test user {context.sudo_login!r}, then press Enter... ')
+        count, status = _count_projects(context.session, context.site_url, sudo_token)
         if count is not None:
             print('Note: after re-enabling the user, the outstanding sudo token works again.')
         elif status in _AUTH_REJECT_STATUSES:
@@ -173,7 +174,7 @@ def _check_disabled_user(
             )
     finally:
         print(
-            f'Restore: make sure the test user {context._sudo_login!r} is re-enabled in SG '
+            f'Restore: make sure the test user {context.sudo_login!r} is re-enabled in SG '
             '(Admin > People) before you leave.'
         )
     return disabled_result
@@ -252,6 +253,8 @@ def _mint_rest_token(
         )
     except requests.RequestException as exc:
         raise RuntimeError(f'cannot reach SG site: {exc.__class__.__name__}: {exc}') from exc
+    except OSError as exc:
+        raise RuntimeError(f'cannot send the SG request: {exc}') from exc
     status = response.status_code
     try:
         data: object = response.json()
@@ -265,6 +268,19 @@ def _mint_rest_token(
     if isinstance(token, str):
         return token, expires if isinstance(expires, int) else 0, status, ''
     return None, 0, status, f'HTTP {status}: {_first_error(fields)}'
+
+
+def _readable_ca_bundle(value: str) -> str:
+    """Require a readable CA bundle file before sending any requests."""
+    path = Path(value)
+    try:
+        if not path.is_file():
+            raise argparse.ArgumentTypeError(f'no readable CA bundle at {value}')
+        with path.open('rb'):
+            pass
+    except OSError as exc:
+        raise argparse.ArgumentTypeError(f'no readable CA bundle at {value}') from exc
+    return value
 
 
 def _require_https_or_loopback(url: str) -> str:
@@ -289,10 +305,10 @@ def _require_https_or_loopback(url: str) -> str:
 def _run_survey(context: _SurveyContext) -> int:
     """Run the full sudo-token survey; returns the exit code."""
     plain_token, expires, _, error = _mint_rest_token(
-        context._session,
-        context._site_url,
-        context._script_name,
-        context._key,
+        context.session,
+        context.site_url,
+        context.script_name,
+        context.key,
         None,
     )
     if plain_token is None:
@@ -303,28 +319,28 @@ def _run_survey(context: _SurveyContext) -> int:
         'stays usable).'
     )
 
-    minted_at = context._clock()
+    minted_at = context.clock()
     sudo_token, sudo_expires, _, error = _mint_rest_token(
-        context._session,
-        context._site_url,
-        context._script_name,
-        context._key,
-        f'sudo_as_login:{context._sudo_login}',
+        context.session,
+        context.site_url,
+        context.script_name,
+        context.key,
+        f'sudo_as_login:{context.sudo_login}',
     )
     if sudo_token is None:
         print(f'Setup failed: sudo-scoped mint rejected: {error}')
         print(
-            f'hint: the ApiUser {context._script_name!r} likely needs a permission rule set with '
+            f'hint: the ApiUser {context.script_name!r} likely needs a permission rule set with '
             'sudo permission enabled, and the login must match an active HumanUser.'
         )
         return 2
-    print(f'Minted a sudo-scoped REST token for {context._sudo_login!r}.')
+    print(f'Minted a sudo-scoped REST token for {context.sudo_login!r}.')
 
     bogus, _, status, error = _mint_rest_token(
-        context._session,
-        context._site_url,
-        context._script_name,
-        context._key,
+        context.session,
+        context.site_url,
+        context.script_name,
+        context.key,
         f'sudo_as_login:{_BOGUS_LOGIN}',
     )
     if bogus is not None:
@@ -340,15 +356,15 @@ def _run_survey(context: _SurveyContext) -> int:
             f'clean rejection ({error}).'
         )
 
-    _compare_project_visibility(context._session, context._site_url, plain_token, sudo_token)
+    _compare_project_visibility(context.session, context.site_url, plain_token, sudo_token)
 
     def mint_sudo() -> tuple[str | None, int, int, str]:
         return _mint_rest_token(
-            context._session,
-            context._site_url,
-            context._script_name,
-            context._key,
-            f'sudo_as_login:{context._sudo_login}',
+            context.session,
+            context.site_url,
+            context.script_name,
+            context.key,
+            f'sudo_as_login:{context.sudo_login}',
         )
 
     disabled_result = _check_disabled_user(
@@ -362,24 +378,12 @@ def _run_survey(context: _SurveyContext) -> int:
     return _EXIT_UNVERIFIED if disabled_result == 'INCONCLUSIVE' else 0
 
 
-def main(
+def _main(
     argv: Iterable[str] | None = None,
     *,
     clock: Callable[[], float] | None = None,
 ) -> int:
-    """Run the interactive sudo-token survey.
-
-    Args:
-        argv: Arguments (defaults to `sys.argv[1:]`).
-        clock: Monotonic clock used to measure the sudo token's age.
-
-    Returns:
-        Process exit code (0 when the disabled-user check was conclusive,
-        2 for a setup error, 3 when the disabled-user check was inconclusive).
-
-    Raises:
-        SystemExit: With status 0 for help or 2 for invalid arguments.
-    """
+    """Run the interactive sudo-token survey."""
     parser = argparse.ArgumentParser(
         description=(__doc__ or '').splitlines()[0],
         epilog=(
@@ -401,11 +405,12 @@ def main(
     )
     parser.add_argument(
         '--proxy',
-        help='HTTP(S) proxy URL, e.g. http://squid:8080 '
+        help='HTTP(S) proxy URL, e.g. http://proxy.example:3128 '
         '(HTTP_PROXY/HTTPS_PROXY env vars are honored without this flag)',
     )
     parser.add_argument(
         '--ca-bundle',
+        type=_readable_ca_bundle,
         help='CA bundle file for TLS verification, e.g. the corporate root CA when the '
         'proxy intercepts TLS (REQUESTS_CA_BUNDLE env var is honored without this flag)',
     )
@@ -440,12 +445,12 @@ def main(
     try:
         result = _run_survey(
             _SurveyContext(
-                _session=session,
-                _site_url=args.site_url,
-                _script_name=args.script_name,
-                _key=key,
-                _sudo_login=args.sudo_login,
-                _clock=tick,
+                session=session,
+                site_url=args.site_url,
+                script_name=args.script_name,
+                key=key,
+                sudo_login=args.sudo_login,
+                clock=tick,
             )
         )
     except RuntimeError as exc:
@@ -455,4 +460,4 @@ def main(
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(_main())

@@ -1,6 +1,8 @@
 """Resolve caller emails to SG logins via the REST `human_users` endpoint."""
 
 import re
+import threading
+import time
 from http import HTTPStatus
 from typing import Protocol, cast
 
@@ -10,6 +12,7 @@ from sg_token_broker._cache import TTLCache
 from sg_token_broker._sg import MintedToken, SGError
 from sg_token_broker._urlpolicy import require_https_or_loopback
 
+_BEARER_EXPIRY_MARGIN_SECONDS = 30
 _HUMAN_USERS_PATH = '/api/v1.1/entity/human_users'
 _LOOKUP_CACHE_TTL_SECONDS = 300.0
 _REQUEST_TIMEOUT_SECONDS = 10.0
@@ -44,7 +47,12 @@ class _PlainMinter(Protocol):
 
 
 class UserDirectory:
-    """Resolve studio emails to SG logins, caching results for about 5 minutes."""
+    """Resolve studio emails to SG logins, caching results for about 5 minutes.
+
+    Lookups share one plain SG token until 30 seconds before its reported
+    expiry. If SG rejects it sooner, the directory mints one replacement and
+    retries the lookup once.
+    """
 
     def __init__(
         self,
@@ -74,15 +82,28 @@ class UserDirectory:
         self._script_key = script_key
         self._cache = TTLCache[str]()
         self._session = requests.Session()
+        self._bearer_lock = threading.Lock()
+        # The lookup token and the monotonic time after which it is not reused.
+        self._bearer: tuple[str, float] | None = None
 
-    def _lookup(self, email: str) -> str:
-        """Return the uncached SG login matching `email`."""
+    def _lookup_bearer(self, rejected: str | None = None) -> str:
+        """Return the shared lookup token, minting one if none is reusable or SG rejected it."""
+        with self._bearer_lock:
+            now = time.monotonic()
+            if self._bearer is not None and self._bearer[0] != rejected and now < self._bearer[1]:
+                return self._bearer[0]
+            try:
+                minted = self._minter.mint_rest_token(self._script_name, self._script_key)
+            except SGError as exc:
+                raise UserLookupError('could not mint the lookup token') from exc
+            reuse_for = (minted.expires_in or 0) - _BEARER_EXPIRY_MARGIN_SECONDS
+            self._bearer = (minted.token, now + reuse_for) if reuse_for > 0 else None
+            return minted.token
+
+    def _query(self, email: str, bearer: str) -> requests.Response:
+        """Send one `human_users` lookup for `email` with `bearer`."""
         try:
-            bearer = self._minter.mint_rest_token(self._script_name, self._script_key).token
-        except SGError as exc:
-            raise UserLookupError('could not mint the lookup token') from exc
-        try:
-            response = self._session.get(
+            return self._session.get(
                 f'{self._site_url}{_HUMAN_USERS_PATH}',
                 params={'filter[email]': email, 'fields': 'login'},
                 headers={'Authorization': f'Bearer {bearer}', 'Accept': 'application/json'},
@@ -90,6 +111,15 @@ class UserDirectory:
             )
         except requests.RequestException as exc:
             raise UserLookupError(f'SG user lookup failed: {exc.__class__.__name__}') from exc
+        except OSError as exc:
+            raise UserLookupError(f'SG user lookup could not be sent: {exc}') from exc
+
+    def _lookup(self, email: str) -> str:
+        """Return the uncached SG login matching `email`."""
+        bearer = self._lookup_bearer()
+        response = self._query(email, bearer)
+        if response.status_code == HTTPStatus.UNAUTHORIZED:
+            response = self._query(email, self._lookup_bearer(rejected=bearer))
         if response.status_code != HTTPStatus.OK:
             raise UserLookupError(f'SG user lookup returned HTTP {response.status_code}')
         try:
@@ -101,9 +131,9 @@ class UserDirectory:
     def resolve_login(self, email: str) -> str:
         """Return the SG login for the (case-insensitive) email.
 
-        Only successful lookups are cached; an unknown identity costs an SG
-        lookup per request.
-        Accepted under the current threat model.
+        Only successful lookups are cached. Concurrent requests for the same
+        identity share an in-progress lookup, including its failure; later
+        requests retry an unknown identity.
 
         Args:
             email: The caller's verified email address.

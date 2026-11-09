@@ -8,8 +8,11 @@ const SERVICE_URL = 'https://sg-token-auth-check-HASH.run.app';
 // audience (it is the script's OAuth client ID, not the service URL).
 function logIdentityAudience() {
   const token = ScriptApp.getIdentityToken();
+  // JWT segments omit base64 padding; restore it before decoding.
+  const segment = token.split('.')[1];
+  const padded = segment + '='.repeat((4 - (segment.length % 4)) % 4);
   const payload = Utilities.newBlob(
-    Utilities.base64DecodeWebSafe(token.split('.')[1])
+    Utilities.base64DecodeWebSafe(padded)
   ).getDataAsString();
   Logger.log(JSON.parse(payload).aud);
 }

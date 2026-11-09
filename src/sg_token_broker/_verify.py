@@ -77,6 +77,10 @@ class _VerifyIO(Protocol):
 
         Returns:
             The entered line.
+
+        Raises:
+            EOFError: If input ends before a line is entered.
+            OSError: If the prompt or input cannot be read or written.
         """
         ...
 
@@ -88,6 +92,10 @@ class _VerifyIO(Protocol):
 
         Returns:
             The entered value.
+
+        Raises:
+            EOFError: If input ends before a value is entered.
+            OSError: If terminal input or output fails.
         """
         ...
 
@@ -96,6 +104,9 @@ class _VerifyIO(Protocol):
 
         Args:
             message: Output text.
+
+        Raises:
+            OSError: If the output cannot be written.
         """
         ...
 
@@ -182,6 +193,8 @@ def run_revocation_check(
             probe explicitly rejects it.
         SGError: If a session probe, including the initial probe, fails or has
             an inconclusive response.
+        EOFError: If an interactive prompt reaches end-of-input.
+        OSError: If interactive input or output fails.
     """
     try:
         minted = minter.mint_session_token(script_name, script_key)

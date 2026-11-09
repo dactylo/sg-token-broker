@@ -1,7 +1,5 @@
 """Interactive OIDC sign-in for desktop tools: PKCE in the system browser."""
 
-# pyright: reportPrivateUsage=false
-
 import base64
 import hashlib
 import json
@@ -10,6 +8,7 @@ import secrets
 import socket
 import sys
 import threading
+import time
 import webbrowser
 from collections.abc import Callable
 from contextlib import suppress
@@ -23,10 +22,16 @@ import requests
 from sg_token_broker._credstore import load_account, load_refresh_token, store_refresh_token
 from sg_token_broker._urlpolicy import require_https_or_loopback
 
-_BROWSER_RESPONSE = b'Sign-in complete. You can close this tab.'
+_BROWSER_ERROR_RESPONSE = (
+    b'Sign-in did not finish. You can close this tab; the program that opened it shows why.'
+)
+_BROWSER_RESPONSE = (
+    b'Sign-in received. You can close this tab and return to the program that opened it.'
+)
 _CALLBACK_PATH = '/callback'
 _GOOGLE_AUTHORIZATION_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth'
 _GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token'  # noqa: S105 - endpoint URL, not a credential
+_ID_TOKEN_REUSE_MARGIN_SECONDS = 60.0
 _JOIN_TIMEOUT_SECONDS = 2.0
 _JWT_PART_COUNT = 3
 _REQUEST_TIMEOUT_SECONDS = 10.0
@@ -45,14 +50,8 @@ class SignInSettingsError(SignInError):
 
 
 @dataclass(frozen=True)
-class TokenBundle:
-    """Represent the credentials produced by one interactive sign-in.
-
-    Attributes:
-        id_token: Provider ID token.
-        refresh_token: Optional provider refresh credential. Defaults to
-            `None`.
-    """
+class _TokenBundle:
+    """Represent the credentials produced by one interactive sign-in."""
 
     id_token: str = field(repr=False)
     refresh_token: str | None = field(repr=False, default=None)
@@ -66,12 +65,12 @@ class _CallbackServer(HTTPServer):
         self._active_request: socket.socket | None = None
         self._closing = False
         self._request_lock = threading.Lock()
-        self._code: str | None = None
-        self._error: str | None = None
-        self._error_description: str | None = None
+        self.code: str | None = None
+        self.error: str | None = None
+        self.error_description: str | None = None
         self._join_timeout = join_timeout
-        self._state: str | None = None
-        self._received = threading.Event()
+        self.state: str | None = None
+        self.received = threading.Event()
         outer = self
 
         class _Handler(BaseHTTPRequestHandler):
@@ -88,7 +87,11 @@ class _CallbackServer(HTTPServer):
                 self.wfile.write(reason)
 
             def do_GET(self) -> None:
-                """Capture an authorization callback or reject an invalid request."""
+                """Capture an authorization callback or reject an invalid request.
+
+                Raises:
+                    OSError: If the HTTP response cannot be written.
+                """
                 try:
                     parts = urlsplit(self.path)
                 except ValueError:
@@ -98,18 +101,24 @@ class _CallbackServer(HTTPServer):
                     self._reject(404, b'not found')
                     return
                 params = parse_qs(parts.query)
-                outer._code = params.get('code', [None])[0]
-                outer._error = params.get('error', [None])[0]
-                outer._error_description = params.get('error_description', [None])[0]
-                outer._state = params.get('state', [None])[0]
+                outer.code = params.get('code', [None])[0]
+                outer.error = params.get('error', [None])[0]
+                outer.error_description = params.get('error_description', [None])[0]
+                outer.state = params.get('state', [None])[0]
+                # The program still has to exchange the code, so never claim success here.
+                page = (
+                    _BROWSER_RESPONSE
+                    if outer.code and outer.error is None
+                    else _BROWSER_ERROR_RESPONSE
+                )
                 try:
                     self.send_response(200)
                     self.send_header('Content-Type', 'text/plain')
-                    self.send_header('Content-Length', str(len(_BROWSER_RESPONSE)))
+                    self.send_header('Content-Length', str(len(page)))
                     self.end_headers()
-                    self.wfile.write(_BROWSER_RESPONSE)
+                    self.wfile.write(page)
                 finally:
-                    outer._received.set()
+                    outer.received.set()
 
             def log_message(self, *args: object, **kwargs: object) -> None:
                 """Suppress the base handler's access-log output."""
@@ -118,7 +127,7 @@ class _CallbackServer(HTTPServer):
         super().__init__(('127.0.0.1', 0), _Handler)
         port = self.server_address[1]
         self._address = ('127.0.0.1', port)
-        self._redirect_uri = f'http://127.0.0.1:{port}{_CALLBACK_PATH}'
+        self.redirect_uri = f'http://127.0.0.1:{port}{_CALLBACK_PATH}'
         self._thread = threading.Thread(target=self._serve_until_callback, daemon=True)
         self._thread.start()
 
@@ -180,7 +189,7 @@ class _CallbackServer(HTTPServer):
     def _serve_until_callback(self) -> None:
         """Serve connections until a callback arrives or shutdown begins."""
         try:
-            while not self._received.is_set():
+            while not self.received.is_set():
                 with self._request_lock:
                     if self._closing:
                         break
@@ -191,7 +200,7 @@ class _CallbackServer(HTTPServer):
     def _wait(self, timeout: float) -> None:
         """Wait for the callback or time out; always shut down the server."""
         try:
-            if not self._received.wait(timeout):
+            if not self.received.wait(timeout):
                 raise SignInError('timed out waiting for the browser sign-in')
         finally:
             self._close()
@@ -201,6 +210,9 @@ class _CallbackServer(HTTPServer):
 
         Args:
             request: The accepted server request.
+
+        Raises:
+            OSError: If closing the accepted socket fails.
         """
         try:
             super().close_request(request)
@@ -217,7 +229,8 @@ class _CallbackServer(HTTPServer):
             The accepted socket and client address.
 
         Raises:
-            OSError: Callback shutdown began before the socket was recorded.
+            OSError: If accepting a connection fails or callback shutdown
+                begins before the accepted socket is recorded.
         """
         request, client_address = super().get_request()
         with self._request_lock:
@@ -271,6 +284,8 @@ def _discovery_document(issuer: str) -> dict[str, object]:
         raise SignInError(str(exc)) from exc
     except requests.RequestException as exc:
         raise SignInError(f'OIDC discovery for {issuer} failed: {exc.__class__.__name__}') from exc
+    except OSError as exc:
+        raise SignInError(f'OIDC discovery for {issuer} could not be sent: {exc}') from exc
     if response.status_code != _SUCCESS_STATUS:
         raise SignInError(f'OIDC discovery for {issuer} returned {response.status_code}')
     try:
@@ -280,6 +295,36 @@ def _discovery_document(issuer: str) -> dict[str, object]:
     if not isinstance(document, dict):
         raise SignInError('OIDC discovery document is not a JSON object')
     return cast('dict[str, object]', document)
+
+
+def _raise_provider_error(callback: _CallbackServer) -> None:
+    """Raise the provider's state-valid authorization error, if any."""
+    if callback.error is None:
+        return
+    detail = f': {callback.error_description}' if callback.error_description is not None else ''
+    raise SignInError(f'authorization provider returned {callback.error}{detail}')
+
+
+def _rejection_message(response: requests.Response, operation: str, *, secret_sent: bool) -> str:
+    """Describe a token endpoint rejection, naming the client secret setting if it was missing."""
+    message = f'{operation} rejected (HTTP {response.status_code})'
+    try:
+        body: object = response.json()
+    except ValueError:
+        return message
+    if not isinstance(body, dict):
+        return message
+    fields = cast('dict[str, object]', body)
+    error = fields.get('error')
+    if not isinstance(error, str):
+        return message
+    message += f': {error}'
+    description = fields.get('error_description')
+    if isinstance(description, str):
+        message += f': {description}'
+        if 'client_secret' in description and not secret_sent:
+            message += "; set SG_USER_TOKEN_CLIENT_SECRET to the OAuth client's secret"
+    return message
 
 
 def _post_token_endpoint(
@@ -299,8 +344,12 @@ def _post_token_endpoint(
         )
     except requests.RequestException as exc:
         raise SignInError(f'token endpoint unreachable: {exc.__class__.__name__}') from exc
+    except OSError as exc:
+        raise SignInError(f'token endpoint request could not be sent: {exc}') from exc
     if response.status_code != _SUCCESS_STATUS:
-        raise SignInError(f'{operation} rejected (HTTP {response.status_code})')
+        raise SignInError(
+            _rejection_message(response, operation, secret_sent='client_secret' in data)
+        )
     try:
         body: object = response.json()
     except ValueError as exc:
@@ -310,33 +359,24 @@ def _post_token_endpoint(
     return cast('dict[str, object]', body)
 
 
-def _raise_provider_error(callback: _CallbackServer) -> None:
-    """Raise the provider's state-valid authorization error, if any."""
-    if callback._error is None:
-        return
-    detail = f': {callback._error_description}' if callback._error_description is not None else ''
-    raise SignInError(f'authorization provider returned {callback._error}{detail}')
-
-
 def _refresh_id_token(
     client_id: str,
     refresh_token: str,
     *,
     token_endpoint: str,
+    client_secret: str | None = None,
     session: requests.Session | None = None,
 ) -> tuple[str | None, str | None]:
     """Exchange a refresh token for a fresh ID token."""
     http = session if session is not None else requests.Session()
-    fields = _post_token_endpoint(
-        http,
-        token_endpoint,
-        {
-            'grant_type': 'refresh_token',
-            'client_id': client_id,
-            'refresh_token': refresh_token,
-        },
-        operation='refresh',
-    )
+    data = {
+        'grant_type': 'refresh_token',
+        'client_id': client_id,
+        'refresh_token': refresh_token,
+    }
+    if client_secret is not None:
+        data['client_secret'] = client_secret
+    fields = _post_token_endpoint(http, token_endpoint, data, operation='refresh')
     id_token = fields.get('id_token')
     rotated = fields.get('refresh_token')
     return (
@@ -345,15 +385,28 @@ def _refresh_id_token(
     )
 
 
+def configured_client_secret() -> str | None:
+    """Return the OAuth client secret from `SG_USER_TOKEN_CLIENT_SECRET`.
+
+    Google requires the secret of a Desktop app client when exchanging a
+    sign-in code or refreshing; other providers may not issue one. The value is
+    stripped of surrounding whitespace.
+
+    Returns:
+        The client secret, or None when the variable is absent or empty.
+    """
+    return os.environ.get('SG_USER_TOKEN_CLIENT_SECRET', '').strip() or None
+
+
 def credential_namespace() -> tuple[str, str]:
-    """Resolve the client and credential issuer from env without network access.
+    """Resolve the credential issuer and client from env without network access.
 
     Read `SG_USER_TOKEN_CLIENT_ID` and optional `SG_USER_TOKEN_ISSUER`,
     stripping surrounding whitespace. An absent or empty issuer selects the
     Google token endpoint as the credential namespace key.
 
     Returns:
-        The client id and issuer key.
+        The issuer key and client id, in the credential store's argument order.
 
     Raises:
         SignInSettingsError: If `SG_USER_TOKEN_CLIENT_ID` is absent or empty
@@ -363,7 +416,7 @@ def credential_namespace() -> tuple[str, str]:
     if not client_id:
         raise SignInSettingsError('SG_USER_TOKEN_CLIENT_ID is not set')
     issuer = os.environ.get('SG_USER_TOKEN_ISSUER', '').strip()
-    return client_id, issuer or _GOOGLE_TOKEN_ENDPOINT
+    return issuer or _GOOGLE_TOKEN_ENDPOINT, client_id
 
 
 def decode_unverified_payload(id_token: str) -> dict[str, object]:
@@ -393,6 +446,14 @@ def decode_unverified_payload(id_token: str) -> dict[str, object]:
     return cast('dict[str, object]', payload)
 
 
+def _reusable(id_token: str) -> bool:
+    """Return True while the token's unverified `exp` is beyond the reuse margin."""
+    exp = decode_unverified_payload(id_token).get('exp')
+    if not isinstance(exp, int | float) or isinstance(exp, bool):
+        return False
+    return exp - time.time() > _ID_TOKEN_REUSE_MARGIN_SECONDS
+
+
 def account_from_id_token(id_token: str) -> str:
     """Derive the credential-store account name from an ID token.
 
@@ -420,7 +481,7 @@ def account_from_id_token(id_token: str) -> str:
 
 
 def identity_settings() -> tuple[str, str, str, str]:
-    """Resolve client, issuer, and provider endpoints from the environment.
+    """Resolve issuer, client, and provider endpoints from the environment.
 
     Use `SG_USER_TOKEN_CLIENT_ID` and optional `SG_USER_TOKEN_ISSUER` as
     resolved by `credential_namespace`. Google uses fixed endpoints;
@@ -428,18 +489,18 @@ def identity_settings() -> tuple[str, str, str, str]:
     between the configured and discovered issuer.
 
     Returns:
-        The client id, issuer key, authorization endpoint, and token endpoint.
+        The issuer key, client id, authorization endpoint, and token endpoint.
 
     Raises:
         SignInSettingsError: If `SG_USER_TOKEN_CLIENT_ID` is missing or
             `SG_USER_TOKEN_ISSUER` is not an acceptable URL.
         SignInError: If OIDC discovery fails or returns an unusable document.
     """
-    client_id, issuer = credential_namespace()
+    issuer, client_id = credential_namespace()
     if issuer == _GOOGLE_TOKEN_ENDPOINT:
         return (
-            client_id,
             _GOOGLE_TOKEN_ENDPOINT,
+            client_id,
             _GOOGLE_AUTHORIZATION_ENDPOINT,
             _GOOGLE_TOKEN_ENDPOINT,
         )
@@ -461,7 +522,7 @@ def identity_settings() -> tuple[str, str, str, str]:
             require_https_or_loopback(endpoint, f'OIDC {name} endpoint')
         except ValueError as exc:
             raise SignInError(str(exc)) from exc
-    return client_id, issuer, auth_endpoint, token_endpoint
+    return issuer, client_id, auth_endpoint, token_endpoint
 
 
 def sign_in(  # noqa: PLR0913 - injectable public flow boundary
@@ -469,11 +530,12 @@ def sign_in(  # noqa: PLR0913 - injectable public flow boundary
     *,
     authorization_endpoint: str,
     token_endpoint: str,
+    client_secret: str | None = None,
     request_offline_access: bool = True,
     open_browser: Callable[[str], object] = webbrowser.open,
     session: requests.Session | None = None,
     timeout: float = _SIGN_IN_TIMEOUT_SECONDS,
-) -> TokenBundle:
+) -> _TokenBundle:
     """Run browser PKCE sign-in and return the resulting credentials.
 
     Open a temporary callback listener on `127.0.0.1` and close it when the
@@ -485,6 +547,8 @@ def sign_in(  # noqa: PLR0913 - injectable public flow boundary
         client_id: The installed app OAuth client id.
         authorization_endpoint: The provider authorization endpoint.
         token_endpoint: The provider token endpoint.
+        client_secret: The installed app's client secret, sent with the code
+            exchange when given. Google requires it for Desktop app clients.
         request_offline_access: Whether to request a refresh credential.
         open_browser: Callable opening the authorization URL. It must return a
             truthy value to report a successful launch.
@@ -497,6 +561,8 @@ def sign_in(  # noqa: PLR0913 - injectable public flow boundary
     Raises:
         SignInError: If browser launch fails, the callback times out, state or
             nonce mismatches, or the provider exchange fails or is malformed.
+        OSError: If the local callback listener cannot be set up or closed.
+        RuntimeError: If the callback serving thread cannot be started.
     """
     verifier = secrets.token_urlsafe(64)
     challenge = (
@@ -508,7 +574,7 @@ def sign_in(  # noqa: PLR0913 - injectable public flow boundary
     query = {
         'response_type': 'code',
         'client_id': client_id,
-        'redirect_uri': callback._redirect_uri,
+        'redirect_uri': callback.redirect_uri,
         'scope': _SCOPES,
         'state': state,
         'nonce': nonce,
@@ -522,31 +588,29 @@ def sign_in(  # noqa: PLR0913 - injectable public flow boundary
         else:
             query['scope'] = f'{_SCOPES} offline_access'
     callback(_authorization_url(authorization_endpoint, query), open_browser, timeout)
-    if callback._state != state:
+    if callback.state != state:
         raise SignInError('authorization response state mismatch')
     _raise_provider_error(callback)
-    if not callback._code:
+    if not callback.code:
         raise SignInError('authorization response carried no code')
     http = session if session is not None else requests.Session()
-    fields = _post_token_endpoint(
-        http,
-        token_endpoint,
-        {
-            'grant_type': 'authorization_code',
-            'client_id': client_id,
-            'code': callback._code,
-            'code_verifier': verifier,
-            'redirect_uri': callback._redirect_uri,
-        },
-        operation='code exchange',
-    )
+    data = {
+        'grant_type': 'authorization_code',
+        'client_id': client_id,
+        'code': callback.code,
+        'code_verifier': verifier,
+        'redirect_uri': callback.redirect_uri,
+    }
+    if client_secret is not None:
+        data['client_secret'] = client_secret
+    fields = _post_token_endpoint(http, token_endpoint, data, operation='code exchange')
     id_token = fields.get('id_token')
     if not isinstance(id_token, str) or not id_token:
         raise SignInError('token endpoint returned no id_token')
     if decode_unverified_payload(id_token).get('nonce') != nonce:
         raise SignInError('id_token nonce mismatch')
     refresh = fields.get('refresh_token')
-    return TokenBundle(
+    return _TokenBundle(
         id_token=id_token, refresh_token=refresh if isinstance(refresh, str) else None
     )
 
@@ -555,27 +619,34 @@ def sign_in(  # noqa: PLR0913 - injectable public flow boundary
 class _DefaultIdTokenSource:
     """Provide ID tokens through refresh credentials or interactive sign-in."""
 
-    _client_id: str
-    _issuer_key: str
-    _authorization_endpoint: str
-    _token_endpoint: str
-    _account: str
-    _uses_stored_pointer: bool
-    _refresh_token: str | None
-    _store_mode: bool
+    client_id: str
+    client_secret: str | None
+    issuer_key: str
+    authorization_endpoint: str
+    token_endpoint: str
+    account: str
+    uses_stored_pointer: bool
+    refresh_token: str | None
+    store_mode: bool
+    # The last interactive ID token, reused while no refresh credential exists.
+    _signed_in: str | None = None
+    _stored_credential_missing: bool = False
 
     def __call__(self) -> str:
         """Return an ID token from stored refresh state or interactive sign-in."""
         account_changed = self._sync_account_pointer()
-        if self._store_mode and not account_changed and not self._sync_stored_credential():
+        if self.store_mode and not account_changed and not self._sync_stored_credential():
             return self._interactive()
-        if self._refresh_token is None:
+        if self.refresh_token is None:
+            if self._signed_in is not None and _reusable(self._signed_in):
+                return self._signed_in
             return self._interactive()
         try:
             id_token, rotated = _refresh_id_token(
-                self._client_id,
-                self._refresh_token,
-                token_endpoint=self._token_endpoint,
+                self.client_id,
+                self.refresh_token,
+                token_endpoint=self.token_endpoint,
+                client_secret=self.client_secret,
             )
         except SignInError:
             return self._interactive()
@@ -585,75 +656,86 @@ class _DefaultIdTokenSource:
             return self._interactive()
         return id_token
 
-    def _adopt_interactive(self, bundle: TokenBundle) -> str:
+    def _adopt_interactive(self, bundle: _TokenBundle) -> str:
         """Adopt interactive credentials without crossing account storage boundaries."""
-        if self._store_mode and account_from_id_token(bundle.id_token) != self._account:
-            self._store_mode = False
-        self._refresh_token = bundle.refresh_token
+        if self.store_mode and account_from_id_token(bundle.id_token) != self.account:
+            self.store_mode = False
+        self.refresh_token = bundle.refresh_token
+        self._signed_in = bundle.id_token
         if (
-            self._store_mode
+            self.store_mode
             and bundle.refresh_token is not None
             and not store_refresh_token(
-                self._issuer_key,
-                self._client_id,
-                self._account,
+                self.issuer_key,
+                self.client_id,
+                self.account,
                 bundle.refresh_token,
             )
         ):
-            self._store_mode = False
+            self.store_mode = False
         return bundle.id_token
 
     def _interactive(self) -> str:
         """Run interactive sign-in and adopt its credentials."""
         return self._adopt_interactive(
             sign_in(
-                self._client_id,
-                authorization_endpoint=self._authorization_endpoint,
-                token_endpoint=self._token_endpoint,
+                self.client_id,
+                authorization_endpoint=self.authorization_endpoint,
+                token_endpoint=self.token_endpoint,
+                client_secret=self.client_secret,
             )
         )
 
     def _persist_rotation(self, rotated: str) -> None:
         """Keep a rotated credential in memory and persist it while authoritative."""
-        self._refresh_token = rotated
-        if self._store_mode and not store_refresh_token(
-            self._issuer_key,
-            self._client_id,
-            self._account,
+        self.refresh_token = rotated
+        if self.store_mode and not store_refresh_token(
+            self.issuer_key,
+            self.client_id,
+            self.account,
             rotated,
         ):
-            self._store_mode = False
+            self.store_mode = False
 
     def _sync_account_pointer(self) -> bool:
         """Adopt a changed stored account and its matching credential."""
-        if not self._uses_stored_pointer:
+        if not self.uses_stored_pointer:
             return False
-        current_account = load_account(self._issuer_key, self._client_id) or ''
-        if current_account == self._account:
+        current_account = load_account(self.issuer_key, self.client_id) or ''
+        if current_account == self.account:
             return False
         current_refresh = (
-            load_refresh_token(self._issuer_key, self._client_id, current_account)
+            load_refresh_token(self.issuer_key, self.client_id, current_account)
             if current_account
             else None
         )
-        self._account = current_account
-        self._refresh_token = current_refresh
-        self._store_mode = current_refresh is not None
+        self.account = current_account
+        self.refresh_token = current_refresh
+        self.store_mode = current_refresh is not None
+        self._signed_in = None
+        self._stored_credential_missing = False
         return True
 
     def _sync_stored_credential(self) -> bool:
         """Reload the selected account's authoritative stored credential."""
-        stored = load_refresh_token(self._issuer_key, self._client_id, self._account)
+        stored = load_refresh_token(self.issuer_key, self.client_id, self.account)
         if stored is None:
+            if self._stored_credential_missing and self.refresh_token is None:
+                return True
+            self._stored_credential_missing = True
+            self.refresh_token = None
+            self._signed_in = None
             return False
-        self._refresh_token = stored
+        self._stored_credential_missing = False
+        self.refresh_token = stored
         return True
 
 
 def default_id_token_source() -> Callable[[], str]:
     """Build a sign-in ID-token source from environment settings.
 
-    Resolve provider settings through `identity_settings`. A non-empty
+    Resolve provider settings through `identity_settings` and the optional
+    client secret through `configured_client_secret`. A non-empty
     `SG_USER_TOKEN_ACCOUNT` fixes account selection; otherwise follow the
     stored last-signed-in account pointer.
 
@@ -664,24 +746,32 @@ def default_id_token_source() -> Callable[[], str]:
         Failed writes or a different interactive account switch that state to
         memory-only use. Browser sign-in runs when refresh cannot supply an ID
         token; credentials obtained without stored state remain in memory.
-        Calls may raise `SignInError` if interactive sign-in fails.
+        Without a refresh credential, an interactive ID token is reused until
+        60 seconds before its `exp` claim, or until the stored account changes.
+        Removing a stored credential discards earlier credentials and requires
+        a new sign-in once; that sign-in's ID token follows the same reuse
+        rule.
+        Calls may raise `SignInError` if interactive sign-in fails, `OSError`
+        if its callback listener cannot be set up or closed, or `RuntimeError`
+        if the callback serving thread cannot be started.
 
     Raises:
         SignInError: If settings are missing or discovery fails.
     """
-    client_id, issuer_key, auth_endpoint, token_endpoint = identity_settings()
+    issuer_key, client_id, auth_endpoint, token_endpoint = identity_settings()
     account = os.environ.get('SG_USER_TOKEN_ACCOUNT', '').strip()
     uses_stored_pointer = not account
     if uses_stored_pointer:
         account = load_account(issuer_key, client_id) or ''
     refresh_token = load_refresh_token(issuer_key, client_id, account) if account else None
     return _DefaultIdTokenSource(
-        _client_id=client_id,
-        _issuer_key=issuer_key,
-        _authorization_endpoint=auth_endpoint,
-        _token_endpoint=token_endpoint,
-        _account=account,
-        _uses_stored_pointer=uses_stored_pointer,
-        _refresh_token=refresh_token,
-        _store_mode=refresh_token is not None,
+        client_id=client_id,
+        client_secret=configured_client_secret(),
+        issuer_key=issuer_key,
+        authorization_endpoint=auth_endpoint,
+        token_endpoint=token_endpoint,
+        account=account,
+        uses_stored_pointer=uses_stored_pointer,
+        refresh_token=refresh_token,
+        store_mode=refresh_token is not None,
     )

@@ -4,9 +4,9 @@ from pathlib import Path
 import pytest
 
 from sg_token_broker._config import ConfigError, load_config
-from tests._tls import _write_tls_material
+from tests._tls import write_tls_material
 
-VALID = """
+_VALID = """
 site_url: https://studio.shotgunstudio.com
 server:
   bind: 127.0.0.1
@@ -32,7 +32,7 @@ _VALID_HASH = (
 
 class TestLoadConfig:
     def test_bad_hash_rejected(self, tmp_path: Path) -> None:
-        text = VALID.format(h='plaintext-oops')
+        text = _VALID.format(h='plaintext-oops')
         with pytest.raises(ConfigError, match='secret_hash'):
             load_config(_write(tmp_path, text))
 
@@ -54,6 +54,24 @@ class TestLoadConfig:
         cfg = load_config(_write(tmp_path, text))
         assert cfg.session_ttl_seconds == 600
         assert cfg.clients['farm'].rate_limit_per_minute == 60
+        assert cfg.clients['farm'].token_types == frozenset({'session', 'rest'})
+
+    @pytest.mark.parametrize('value', ['[]', '[jwt]', 'rest', '[[rest]]'])
+    @pytest.mark.parametrize(
+        ('needle', 'where'),
+        [
+            ('  rate_limit_per_minute: 30\n', 'defaults.token_types'),
+            ('    scopes: [read_all]\n', 'clients.farm.token_types'),
+        ],
+        ids=['defaults', 'client'],
+    )
+    def test_invalid_token_types_rejected(
+        self, tmp_path: Path, needle: str, where: str, value: str
+    ) -> None:
+        indent = needle[: len(needle) - len(needle.lstrip())]
+        text = _valid_text().replace(needle, f'{needle}{indent}token_types: {value}\n', 1)
+        with pytest.raises(ConfigError, match=where):
+            load_config(_write(tmp_path, text))
 
     def test_loopback_http_site_url_accepted(self, tmp_path: Path) -> None:
         text = _valid_text().replace('https://studio.shotgunstudio.com', 'http://127.0.0.1:8888')
@@ -66,7 +84,7 @@ class TestLoadConfig:
         assert config.server.tls is None
 
     def test_malformed_scrypt_hash_rejected(self, tmp_path: Path) -> None:
-        text = VALID.format(h='scrypt$3$8$1$c2FsdA==$ZGlnZXN0')
+        text = _VALID.format(h='scrypt$3$8$1$c2FsdA==$ZGlnZXN0')
         with pytest.raises(ConfigError, match='secret_hash'):
             load_config(_write(tmp_path, text))
 
@@ -84,10 +102,10 @@ class TestLoadConfig:
     def test_mismatched_tls_pair_is_a_config_error(self, tmp_path: Path) -> None:
         directory_a = tmp_path / 'a'
         directory_a.mkdir()
-        cert_a, _ = _write_tls_material(directory_a)
+        cert_a, _ = write_tls_material(directory_a)
         directory_b = tmp_path / 'b'
         directory_b.mkdir()
-        _, key_b = _write_tls_material(directory_b)
+        _, key_b = write_tls_material(directory_b)
         text = _valid_text().replace(
             'server:\n',
             f'server:\n  bind: 0.0.0.0\n  tls:\n    cert_file: {cert_a}\n    key_file: {key_b}\n',
@@ -160,9 +178,91 @@ class TestLoadConfig:
         with pytest.raises(ConfigError, match='cert'):
             load_config(_write(tmp_path, text))
 
+    @pytest.mark.parametrize('field', ['cert_file', 'key_file'])
+    @pytest.mark.parametrize('value', [None, "''", '42'], ids=['missing', 'empty', 'number'])
+    def test_tls_paths_must_be_non_empty_strings(
+        self, tmp_path: Path, field: str, value: str | None
+    ) -> None:
+        cert, key = write_tls_material(tmp_path)
+        lines = ''.join(
+            f'    {name}: {value if name == field else path}\n'
+            for name, path in (('cert_file', cert), ('key_file', key))
+            if name != field or value is not None
+        )
+        text = _valid_text().replace(
+            'server:\n  bind: 127.0.0.1\n  port: 8743\n',
+            f'server:\n  bind: 127.0.0.1\n  port: 8743\n  tls:\n{lines}',
+        )
+        with pytest.raises(ConfigError, match=rf'server\.tls\.{field} must be a non-empty string'):
+            load_config(_write(tmp_path, text))
+
+    @pytest.mark.parametrize(
+        ('default_types', 'client_types', 'expected'),
+        [
+            (None, '[rest]', {'rest'}),
+            ('[rest]', None, {'rest'}),
+            ('[rest]', '[session, rest]', {'session', 'rest'}),
+        ],
+        ids=['client', 'default', 'client-overrides-default'],
+    )
+    def test_token_types_restrict_each_client(
+        self,
+        tmp_path: Path,
+        default_types: str | None,
+        client_types: str | None,
+        expected: set[str],
+    ) -> None:
+        text = _valid_text()
+        if default_types is not None:
+            text = text.replace(
+                '  rate_limit_per_minute: 30\n',
+                f'  rate_limit_per_minute: 30\n  token_types: {default_types}\n',
+                1,
+            )
+        if client_types is not None:
+            text = text.replace(
+                '    scopes: [read_all]\n',
+                f'    scopes: [read_all]\n    token_types: {client_types}\n',
+                1,
+            )
+        assert load_config(_write(tmp_path, text)).clients['farm'].token_types == expected
+
+    @pytest.mark.parametrize(
+        ('anchor', 'addition', 'message'),
+        [
+            ('site_url:', 'default: {}\n', 'unknown config key: default'),
+            ('  session_ttl_seconds:', '  token_type: [rest]\n', 'key: defaults.token_type'),
+            ('    script_name:', '    script_key: x\n', 'key: scopes.read_all.script_key'),
+            ('    scopes: [read_all]', '    token_type: [rest]\n', 'key: clients.farm.token_type'),
+            ('  port:', '  ports: 8744\n', 'unknown config key: server.ports'),
+            (
+                '    secret_hash:',
+                '    tokens: [rest]\n    rate_limit: 5\n',
+                'unknown config keys: clients.farm.rate_limit, clients.farm.tokens',
+            ),
+        ],
+        ids=['root', 'defaults', 'scope', 'client', 'server', 'several'],
+    )
+    def test_unknown_keys_rejected(
+        self, tmp_path: Path, anchor: str, addition: str, message: str
+    ) -> None:
+        text = _valid_text()
+        assert anchor in text
+        with pytest.raises(ConfigError, match=rf'{message}$'):
+            load_config(_write(tmp_path, text.replace(anchor, addition + anchor, 1)))
+
     def test_unknown_scope_in_client_rejected(self, tmp_path: Path) -> None:
         text = _valid_text().replace('scopes: [read_all]', 'scopes: [nope]')
         with pytest.raises(ConfigError, match='nope'):
+            load_config(_write(tmp_path, text))
+
+    def test_unknown_tls_key_rejected(self, tmp_path: Path) -> None:
+        cert, key = write_tls_material(tmp_path)
+        text = _valid_text().replace(
+            '  port: 8743\n',
+            f'  port: 8743\n  tls:\n    cert_file: {cert}\n    key_file: {key}\n    ca_file: x\n',
+        )
+        with pytest.raises(ConfigError, match=r'unknown config key: server\.tls\.ca_file$'):
             load_config(_write(tmp_path, text))
 
     def test_unyamlish_file_raises(self, tmp_path: Path) -> None:
@@ -195,7 +295,7 @@ class TestLoadConfig:
         assert load_config(_write(tmp_path, text)).clients['farm'].client_id == 'farm'
 
     def test_weak_secret_hash_is_rejected(self, tmp_path: Path) -> None:
-        text = VALID.format(h='scrypt$2$1$1$c2FsdA==$AQ==')
+        text = _VALID.format(h='scrypt$2$1$1$c2FsdA==$AQ==')
         with pytest.raises(ConfigError, match='secret_hash is malformed'):
             load_config(_write(tmp_path, text))
 
@@ -220,9 +320,23 @@ class TestLoadConfig:
         with pytest.raises(ConfigError, match=message):
             load_config(_write(tmp_path, text.replace(needle, replacement, 1)))
 
+    @pytest.mark.parametrize(
+        'scalar', ['2026-13-01', '!!int ' + 'x' * 1000], ids=['invalid-date', 'invalid-integer']
+    )
+    def test_yaml_scalar_value_errors_are_bounded_config_errors(
+        self, tmp_path: Path, scalar: str
+    ) -> None:
+        path = _write(tmp_path, f'site_url: {scalar}\n')
+
+        with pytest.raises(ConfigError) as caught:
+            load_config(path)
+
+        assert str(caught.value) == f'invalid YAML in {path}'
+        assert isinstance(caught.value.__cause__, ValueError)
+
 
 def _valid_text() -> str:
-    return VALID.format(h=_VALID_HASH)
+    return _VALID.format(h=_VALID_HASH)
 
 
 def _write(tmp_path: Path, text: str) -> Path:

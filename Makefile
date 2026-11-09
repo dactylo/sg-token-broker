@@ -1,7 +1,10 @@
 .DEFAULT_GOAL := all
 
 PYTHON ?= python
-PYTHON_FILES := $(wildcard src tests scripts)
+# Every file git tracks or would add, except paths git marks `private`.
+git_files = $(wildcard $(shell git -c core.quotePath=false ls-files --cached --others --exclude-standard -- $(1) ':(exclude,attr:private)'))
+MARKDOWN_FILES = $(call git_files,'*.md')
+PYTHON_FILES = $(call git_files,'*.py' '*.pyi')
 VENV_BIN := .venv/bin
 ifeq ($(OS),Windows_NT)
 VENV_BIN := .venv/Scripts
@@ -9,17 +12,20 @@ endif
 DEV_PYTHON := $(VENV_BIN)/python
 export PATH := $(abspath $(VENV_BIN)):$(PATH)
 export UV_SYSTEM_PYTHON := 0
-UV_VERSION := 0.12.23
+UV_VERSION := 0.13.6
 
 CI_PYTHON := 3.11
 CI_EXTRAS := --extra google --extra login --extra oidc
+IMAGE_EXTRAS := --extra google --extra oidc
 CI_BUILD_REQUIREMENTS = $(DEV_PYTHON) -c 'import tomllib; print("\n".join(tomllib.load(open("pyproject.toml", "rb"))["build-system"]["requires"]))'
-CI_COMPILE = uv pip compile pyproject.toml - $(CI_EXTRAS) --universal --python-version $(CI_PYTHON) --no-python-downloads --no-sources --no-build --generate-hashes --no-annotate --custom-compile-command 'make lock-update'
+LOCK_COMPILE = uv pip compile pyproject.toml - --universal --python-version $(CI_PYTHON) --no-python-downloads --no-sources --no-build --generate-hashes --no-annotate --custom-compile-command 'make lock-update'
+CI_COMPILE = $(LOCK_COMPILE) $(CI_EXTRAS)
+IMAGE_COMPILE = $(LOCK_COMPILE) $(IMAGE_EXTRAS)
 
 BIOME_FILES := biome.json scripts/cloud_run_auth_check/appsscript/appsscript.json $(wildcard pyrightconfig.json)
-MARKDOWN_FILES := README.md docs/development.md docs/deployment.md docs/design.md docs/modes.md docs/sg-token-behavior.md docs/user-token-service.md scripts/cloud_run_auth_check/README.md
+WORKFLOW_FILES := $(wildcard .github/workflows/*.yml)
 
-.PHONY: all check env-check format format-check install lock-check lock-update quality reinstall setup test type-check uv-check venv-check whitespace-check
+.PHONY: all check env-check file-check format format-check install lock-check lock-update quality reinstall setup test type-check uv-check venv-check whitespace-check workflow-check
 
 uv-check:
 	@test "$$(uv --version | cut -d ' ' -f 2)" = "$(UV_VERSION)" || \
@@ -41,22 +47,29 @@ env-check: venv-check
 		cmp -s pyproject.toml .venv/.pyproject.toml || \
 		{ echo 'Project setup is incomplete or outdated; run make setup.' >&2; exit 1; }
 
+# A tool given no files, or a folder, searches folders itself; stop before that can happen.
+file-check:
+	@test -n "$(PYTHON_FILES)" && test -n "$(MARKDOWN_FILES)" || \
+		{ echo 'git listed no files to check; run make from a git checkout.' >&2; exit 1; }
+	@! git ls-files --cached --others --exclude-standard -- '*.py' '*.pyi' '*.md' ':(exclude,attr:private)' | grep -q '[[:space:]]' || \
+		{ echo 'Rename Python and Markdown files whose names contain whitespace.' >&2; exit 1; }
+
 install:
 	uv tool install .
 
 reinstall:
 	uv tool install --reinstall .
 
-format: env-check
+format: env-check file-check
 	$(DEV_PYTHON) -m ruff format $(PYTHON_FILES)
-	$(DEV_PYTHON) -m ruff check --fix $(PYTHON_FILES)
+	$(DEV_PYTHON) -m ruff check --fix $(PYTHON_FILES) pyproject.toml
 	biome format --write $(BIOME_FILES)
 	$(DEV_PYTHON) -m mdformat $(MARKDOWN_FILES)
 	$(VENV_BIN)/pyproject-fmt pyproject.toml
 
-format-check: env-check
+format-check: env-check file-check
 	$(DEV_PYTHON) -m ruff format --check $(PYTHON_FILES)
-	$(DEV_PYTHON) -m ruff check $(PYTHON_FILES)
+	$(DEV_PYTHON) -m ruff check $(PYTHON_FILES) pyproject.toml
 	biome format $(BIOME_FILES)
 	$(DEV_PYTHON) -m mdformat --check $(MARKDOWN_FILES)
 	$(VENV_BIN)/pyproject-fmt --check pyproject.toml
@@ -67,25 +80,30 @@ lock-check: env-check uv-check
 	$(CI_BUILD_REQUIREMENTS) | $(CI_COMPILE) --group dev --group ci-build --quiet --output-file "$$tmp/requirements-ci.txt" && \
 	diff -u requirements-ci.txt "$$tmp/requirements-ci.txt" && \
 	$(CI_BUILD_REQUIREMENTS) | $(CI_COMPILE) --group test --constraint "$$tmp/requirements-ci.txt" --quiet --output-file "$$tmp/requirements-test.txt" && \
-	diff -u requirements-test.txt "$$tmp/requirements-test.txt"
+	diff -u requirements-test.txt "$$tmp/requirements-test.txt" && \
+	$(CI_BUILD_REQUIREMENTS) | $(IMAGE_COMPILE) --constraint "$$tmp/requirements-ci.txt" --quiet --output-file "$$tmp/requirements-image.txt" && \
+	diff -u requirements-image.txt "$$tmp/requirements-image.txt"
 
 lock-update: venv-check uv-check
 	$(CI_BUILD_REQUIREMENTS) | $(CI_COMPILE) --group dev --group ci-build --output-file requirements-ci.txt $(LOCK_FLAGS)
 	$(CI_BUILD_REQUIREMENTS) | $(CI_COMPILE) --group test --constraint requirements-ci.txt --output-file requirements-test.txt
+	$(CI_BUILD_REQUIREMENTS) | $(IMAGE_COMPILE) --constraint requirements-ci.txt --output-file requirements-image.txt
 
-type-check: env-check
+type-check: env-check file-check
 	@for platform in Linux Darwin Windows; do \
-		$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform $$platform || exit; \
+		$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform $$platform $(PYTHON_FILES) || exit; \
 	done
 
 test: env-check
 	$(DEV_PYTHON) -m pytest -q $(TEST_FLAGS)
 
 whitespace-check:
-	git diff --check "$$(git hash-object -t tree /dev/null)" -- \
-		':(top,glob)*' .github $(PYTHON_FILES) typings $(MARKDOWN_FILES)
+	git diff --check "$$(git hash-object -t tree /dev/null)" -- . ':(exclude,attr:private)'
 
-quality: format-check lock-check type-check whitespace-check
+workflow-check: env-check
+	$(VENV_BIN)/zizmor --offline --no-progress --quiet $(WORKFLOW_FILES)
+
+quality: format-check lock-check type-check whitespace-check workflow-check
 
 check: quality test
 

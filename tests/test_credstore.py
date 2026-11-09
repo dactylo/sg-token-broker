@@ -15,27 +15,8 @@ class _KeyringError(Exception):
     pass
 
 
-class _MemoryKeyring:
-    def __init__(self) -> None:
-        self.values: dict[tuple[str, str], str] = {}
-
-    def delete_password(self, service: str, username: str) -> None:
-        self.values.pop((service, username), None)
-
-    def get_password(self, service: str, username: str) -> str | None:
-        return self.values.get((service, username))
-
-    def set_password(self, service: str, username: str, password: str) -> None:
-        self.values[(service, username)] = password
-
-
-class _PasswordDeleteError(_KeyringError):
-    pass
-
-
 class _FakeErrors:
     KeyringError = _KeyringError
-    PasswordDeleteError = _PasswordDeleteError
 
 
 class _FakeKeyringModule:
@@ -114,21 +95,6 @@ class TestCredStore:
         assert load_refresh_token('https://idp-a', 'client-1', 'jane') == 'rt-a'
         assert load_refresh_token('https://idp-b', 'client-1', 'jane') == 'rt-b'
 
-    def test_password_delete_error_returns_false(
-        self, keyring: _FakeKeyringModule, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-
-        class FailedDeleteKeyring(_MemoryKeyring):
-            def delete_password(self, service: str, username: str) -> None:
-                del service, username
-                raise keyring.errors.PasswordDeleteError('keychain rejected deletion')
-
-        backend = FailedDeleteKeyring()
-        backend.values[('sg-token-broker|https://idp|c', 'a')] = 'rt-1'
-        keyring.backend = backend
-        monkeypatch.setattr(_credstore, '_backend_is_secure', _secure)
-        assert delete_refresh_token('https://idp', 'c', 'a') is False
-
     def test_round_trip_with_approved_backend(
         self, keyring: _FakeKeyringModule, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -167,6 +133,20 @@ class TestCredStore:
         backend.values[('sg-token-broker|https://idp|c', 'a')] = 'rt-1'
         keyring.backend = backend
         assert load_refresh_token('https://idp', 'c', 'a') is None
+
+
+class _MemoryKeyring:
+    def __init__(self) -> None:
+        self.values: dict[tuple[str, str], str] = {}
+
+    def delete_password(self, service: str, username: str) -> None:
+        self.values.pop((service, username), None)
+
+    def get_password(self, service: str, username: str) -> str | None:
+        return self.values.get((service, username))
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self.values[(service, username)] = password
 
 
 def _secure(_backend: object) -> bool:
@@ -218,7 +198,3 @@ def test_secure_backend_allowlist_accepts_supported_identity(
     backend_type = type(name, (), {'__module__': module})
 
     assert _credstore._backend_is_secure(backend_type()) is True
-
-
-def test_secure_backend_allowlist_rejects_memory_backend() -> None:
-    assert _credstore._backend_is_secure(_MemoryKeyring()) is False

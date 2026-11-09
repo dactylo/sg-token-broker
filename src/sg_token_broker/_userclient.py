@@ -97,9 +97,9 @@ class UserTokenClient:
         Raises:
             UserTokenClientError: If the service URL is missing, malformed,
                 unsupported, or insecure; if `timeout` is non-finite or not
-                greater than zero; or if the default sign-in settings are
-                missing or invalid, or OIDC discovery for the default sign-in
-                fails.
+                greater than zero; if `refresh_margin` is non-finite or
+                negative; or if the default sign-in settings are missing or
+                invalid, or OIDC discovery for the default sign-in fails.
         """
         self._service_url = (service_url or os.environ.get(_ENV_URL, '')).rstrip('/')
         if not self._service_url:
@@ -113,6 +113,10 @@ class UserTokenClient:
         if not (math.isfinite(timeout) and timeout > 0):
             raise UserTokenSettingsError(
                 f'timeout must be finite and greater than zero, got {timeout}'
+            )
+        if not (math.isfinite(refresh_margin) and refresh_margin >= 0):
+            raise UserTokenSettingsError(
+                f'refresh_margin must be finite and >= 0 seconds, got {refresh_margin}'
             )
         if id_token_source is None:
             try:
@@ -143,6 +147,27 @@ class UserTokenClient:
             raise UserTokenClientError('identity token has no decodable sub claim')
         return id_token, sub
 
+    @staticmethod
+    def _service_error(response: requests.Response) -> UserTokenClientError:
+        """Describe a rejected service response using its JSON fields when available."""
+        message = f'service refused (HTTP {response.status_code}'
+        try:
+            body: object = response.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            fields = cast('dict[str, object]', body)
+            error = fields.get('error')
+            if isinstance(error, str):
+                message += f' {error}'
+            detail = fields.get('detail')
+        else:
+            detail = None
+        message += ')'
+        if isinstance(detail, str):
+            message += f': {detail}'
+        return UserTokenClientError(message)
+
     def _request(self, token_type: str, id_token: str, *, refresh: bool) -> UserToken:
         """GET /v1/user-token and parse the response."""
         params: dict[str, str] = {'token_type': token_type}
@@ -157,10 +182,12 @@ class UserTokenClient:
             )
         except requests.RequestException as exc:
             raise UserTokenClientError(
-                f'cannot reach user-token service at {self._service_url}: {exc.__class__.__name__}'
+                f'cannot reach user-token service at {self._service_url}: {exc}'
             ) from exc
+        except OSError as exc:
+            raise UserTokenClientError(f'user-token request could not be sent: {exc}') from exc
         if response.status_code != _OK_STATUS:
-            raise UserTokenClientError(f'service refused (HTTP {response.status_code})')
+            raise self._service_error(response)
         try:
             body: object = response.json()
         except ValueError as exc:
@@ -205,6 +232,10 @@ class UserTokenClient:
                 fails or the identity token has no decodable subject, the
                 service is unreachable or refuses, or its response is malformed
                 or mismatched.
+            OSError: If the default sign-in flow cannot set up or close its
+                local callback listener.
+            RuntimeError: If the default sign-in flow cannot start its callback
+                serving thread.
         """
         with self._lock:
             if token_type not in _TOKEN_TYPES:

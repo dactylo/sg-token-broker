@@ -6,22 +6,11 @@ as clients. The steps use Linux, systemd, and a TLS reverse proxy. For a first r
 machine, use the [quick start](../README.md#quick-start); for tokens that carry a person's own SG
 permissions, use the [user-token service guide](user-token-service.md).
 
-| If you want to...                                      | Start here                                                                                       |
-| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
-| Install the broker on a Linux host                     | [Install the broker](#install-the-broker)                                                        |
-| Create the SG script accounts behind each scope        | [Create SG script accounts](#create-sg-script-accounts)                                          |
-| Issue a credential to a consuming system               | [Create broker clients](#create-broker-clients)                                                  |
-| Write or change the broker configuration               | [Write the configuration](#write-the-configuration)                                              |
-| Run the broker as a service                            | [Run the broker with systemd](#run-the-broker-with-systemd)                                      |
-| Put the broker behind TLS and restrict access          | [Restrict network access](#restrict-network-access)                                              |
-| Point a farm job or tool at the broker                 | [Configure client environments](#configure-client-environments)                                  |
-| Rotate a secret, revoke a client, or respond to a leak | [Operations](#operations)                                                                        |
-| Trace a token or investigate a denial                  | [Audit logs](#audit-logs)                                                                        |
-| Test how your SG site revokes sessions                 | [Verify revocation behavior](#verify-revocation-behavior-on-a-trial-site)                        |
-| Look up a configuration key or HTTP status             | [Configuration reference](#configuration-reference) or [HTTP API reference](#http-api-reference) |
+Follow the setup steps below, then use [Operations](#operations) for credential changes and
+[Audit logs](#audit-logs) to investigate requests. Look up individual settings and responses in the
+[configuration](#configuration-reference) and [HTTP API](#http-api-reference) references.
 
-Read the [design guide](design.md) for the security boundaries before you expose the broker to
-other hosts.
+Read the [security boundaries](design.md) before exposing the broker to other hosts.
 
 ## Install the broker
 
@@ -64,11 +53,15 @@ needs. For each scope:
 4. If your site supports an API IP allowlist, restrict these script accounts to the broker host's
    egress IP address, so that a leaked key does not work from elsewhere.
 
-A practical starting set has two scopes: `read_all`, backed by `broker_read_all`, for reporting,
-dashboards, and farm reads; and `write_production`, backed by `broker_write_production`, for
-publishing and ingest tools. Add narrower scopes as needs appear. Each one costs only a script
-account and a configuration entry, and a narrower scope limits what a leaked client credential can
-reach.
+The configuration below uses two scopes:
+
+| Scope              | Script account            | Typical use                           |
+| ------------------ | ------------------------- | ------------------------------------- |
+| `read_all`         | `broker_read_all`         | Reporting, dashboards, and farm reads |
+| `write_production` | `broker_write_production` | Publishing and ingest                 |
+
+Add narrower scopes as needed. Each requires a script account and a configuration entry, and limits
+what a leaked client credential can reach.
 
 ## Create broker clients
 
@@ -80,15 +73,13 @@ you revoke one system without affecting the others. For each client, run:
 sg-token-broker hash-secret
 ```
 
-Deliver the printed `secret` to the consuming system's secret store, such as the farm's environment
-injection or a deployment secret. Put only the printed `hash` in the broker configuration. Always
-produce stored hashes with `hash-secret`: configuration validation accepts only the scrypt
-parameters, salt length, and digest length that it emits.
-
-Clients send their credentials in an HTTP Basic `Authorization` header, which limits the characters
-they can contain. A client ID has 1 to 64 characters from the printable ASCII range 0x21-0x7E,
-excluding `:`. A client secret is a non-empty string from the same range. Spaces and non-ASCII
-characters are invalid in either.
+Deliver the printed `secret` to the hosts that run the consuming system, for example as a
+root-owned file placed by configuration management or through the service manager's credential
+mechanism. Do not commit it to source control or put it in job-level settings, such as job
+environment variables that a render scheduler shows to its users. Any process on those hosts that
+can read the secret can use it, including jobs that other people submit. Put only the printed
+`hash` in the broker configuration. Use `hash-secret` for every stored hash; other hash formats are
+rejected. See [Client credentials](#client-credentials) for the accepted ID and secret characters.
 
 ## Write the configuration
 
@@ -125,10 +116,18 @@ clients:
   pipeline_publish:
     secret_hash: scrypt$16384$8$1$...$...
     scopes: [read_all, write_production]
+  dailies_ingest:
+    secret_hash: scrypt$16384$8$1$...$...
+    scopes: [read_all]
+    token_types: [rest]
 ```
 
 Replace each sample `secret_hash` with a value printed by `hash-secret`. The
 [configuration reference](#configuration-reference) lists every key and its default.
+
+Set `token_types: [rest]` for a client whose tools do not use `shotgun_api3`, as for
+`dailies_ingest` above. Its secret then cannot obtain session tokens, which stay usable for as long
+as someone keeps using them. Clients without `token_types` may request both types.
 
 Create the key files `/etc/sg-token-broker/keys/read_all` and
 `/etc/sg-token-broker/keys/write_production`, each containing the matching script account's
@@ -195,12 +194,10 @@ path in `broker.yml`: the `read_all` credential becomes
 the same directory. systemd copies credentials when it starts the unit, so restart the service
 after changing any source file.
 
-The hardening options limit what a compromised broker process could do. `DynamicUser=yes` runs it
-as a temporary unprivileged user. `ProtectSystem=strict` and `ProtectHome=yes` make the file system
-read-only and hide home directories. The remaining options give the service a private `/tmp`; block
-device access, changes to kernel tunables and control groups, privilege escalation, and writable
-executable memory; allow only IPv4 and IPv6 sockets; and restrict system calls to those a typical
-service needs. The broker writes no files, so it runs within these limits.
+The hardening options run the broker as a temporary unprivileged user, make the file system
+read-only, hide home directories, and isolate temporary files. They also restrict devices, kernel
+and control-group changes, privilege escalation, writable executable memory, sockets, and system
+calls. The broker writes no files, so it runs within these limits.
 
 After saving the unit and configuring the TLS proxy and network controls below, start the service:
 
@@ -228,11 +225,15 @@ appear.
 
 ## Restrict network access
 
+### Put TLS and access controls in front of the broker
+
 The broker's HTTP server comes from Python's standard library. It validates request parsing but is
 not designed for direct exposure, so put a reverse proxy, such as nginx or Caddy, in front of it.
 
 Allow inbound connections only from the pipeline VLANs and farm subnets that need tokens. Anyone
-who can reach the broker can try client credentials.
+who can reach the broker can try client credentials. This restriction is also what limits a leaked
+client secret, which works only from hosts that can reach the broker. It does not limit issued SG
+tokens, which work wherever SG accepts them.
 
 Use TLS for all traffic beyond loopback. The recommended layout runs the proxy on the same host and
 binds the broker to `127.0.0.1:8743`, so the proxy absorbs connection floods, slow requests, and
@@ -240,14 +241,16 @@ protocol edge cases before they reach the broker. If a proxy is impractical, con
 TLS (`server.tls`) and bind a LAN address. That puts the Python listener directly on the network,
 so restrict inbound sources as described above.
 
+The broker refuses to start with plain HTTP on a non-loopback address, and clients refuse
+plain-HTTP broker URLs for remote hosts. Remote traffic therefore always uses TLS, at the proxy or
+through `server.tls`.
+
+### Limit connections and failed authentication
+
 In-process TLS mode has no failed-authentication limiter. Every well-formed token request runs one
 client-secret verification that needs about 16 MiB of memory, whether or not the credentials are
 valid, so a flood of failed attempts is bounded only by the 32-request limit below: about 512 MiB
 and the host's CPU cores.
-
-The broker refuses to start with plain HTTP on a non-loopback address, and clients refuse
-plain-HTTP broker URLs for remote hosts. Remote traffic therefore always uses TLS, at the proxy or
-through `server.tls`.
 
 Configure request rates, per-source connection limits, overall connection rates, and slow-client
 protection at the proxy, for example with nginx `limit_req` and `limit_conn`. The broker's own
@@ -262,6 +265,8 @@ limits are coarse:
   receive HTTP 429. The limit applies only after the client's secret is verified, so it does not
   slow down floods of failed authentication. Limit those at the proxy.
 
+### Check health and configure SG egress
+
 Monitor `GET /healthz`. It requires no authentication and makes no SG request, so it shows only
 that the broker is accepting requests.
 
@@ -269,7 +274,7 @@ If the broker reaches SG through an egress proxy, such as Squid, set the standar
 the unit; the broker's HTTP library honors it:
 
 ```ini
-Environment=HTTPS_PROXY=http://squid:8080
+Environment=HTTPS_PROXY=http://proxy.example:3128
 ```
 
 If that proxy intercepts TLS, also set
@@ -279,7 +284,8 @@ carry the script keys.
 
 ## Configure client environments
 
-Each consuming system sets three environment variables, for example injected into each farm job:
+Each consuming system sets three environment variables in the processes that request tokens, for
+example from a root-owned file that the worker service on each host loads:
 
 ```sh
 export SG_TOKEN_BROKER_URL='https://sg-broker.studio.internal'
@@ -289,7 +295,10 @@ export SG_TOKEN_BROKER_CLIENT_SECRET='value-from-the-secret-store'
 
 Python tools use `sg_token_broker.BrokerClient`, which reads these variables or accepts
 `broker_url`, `client_id`, and `client_secret` arguments. It caches each scope and token type in
-memory and reuses the token until 60 seconds before its `expires_at`, without checking with SG.
+memory and reuses the token until 60 seconds before its `expires_at`, without checking with SG. If
+the broker is then unreachable, failing, or rate limiting, or returns the same token, the client
+keeps the token until `expires_at` and asks again then. To replace a token that SG rejects sooner,
+see [replacing a rejected app token](sg-token-behavior.md#replacing-a-rejected-app-token).
 
 Shell tools use `sg-token-broker get-token --scope read_all`, which prints the token as JSON.
 `get-token` waits up to 10 seconds for each attempt (`--timeout`) and retries connection failures
@@ -335,11 +344,16 @@ outstanding sessions. To rehearse this procedure with a disposable account, use 
 
 ### Rotate a script key routinely
 
-Routine rotation limits how long a silently leaked key stays useful. Regenerate the key in SG,
-update the source key file, and restart the service. Until the restart, requests that the broker
-cannot answer from its cache fail with HTTP 502, because the broker still holds the old key.
-Rotation does not revoke outstanding sessions; use the
-[account replacement procedure](#retire-a-compromised-script-account) for that.
+Regenerate the key in SG, update its source file, and restart the systemd service. systemd copies
+`LoadCredential` files at startup; changing `/etc/sg-token-broker/keys/read_all` does not change
+the running service's copy.
+
+For deployments that read a key file directly, the broker rereads it at each mint, so replacing
+that file takes effect at the next mint. Keys supplied through environment variables need a
+restart. While SG rejects the old key, requests that need a fresh token fail with HTTP 502.
+
+Routine rotation limits how long a leaked key can mint tokens. It does not revoke outstanding
+sessions; use the [account replacement procedure](#retire-a-compromised-script-account) for that.
 
 ### Match the session cache to SG's session expiry
 
@@ -356,12 +370,12 @@ The broker writes every issuance, denial, and error as one JSON line. Records ne
 values or secrets. `token_fp` identifies a token by the first 16 hexadecimal characters of its
 SHA-256 digest.
 
-| Event                                     | Fields                                                                                                               |
-| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| Issue (`issue`)                           | `ts`, `event`, `client_id`, `scope`, `token_type`, `token_fp`, `cache`, `source_ip`, `request_id`                    |
-| Request denial or error (`deny`, `error`) | `ts`, `event`, `client_id`, `scope`, `token_type`, `reason`, `source_ip`, `request_id`; `detail` for upstream errors |
-| Pre-service denial (`deny`)               | `ts`, `event`, `reason`, `source_ip`, `request_id`                                                                   |
-| Unhandled error (`error`)                 | `ts`, `event`, `reason`, `detail`, `source_ip`, `request_id`                                                         |
+| Event                                     | Fields                                                                                                                                          |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Issue (`issue`)                           | `ts`, `event`, `client_id`, `scope`, `token_type`, `token_fp`, `cache`, `source_ip`, `request_id`                                               |
+| Request denial or error (`deny`, `error`) | `ts`, `event`, `client_id`, `scope`, `token_type`, `reason`, `source_ip`, `request_id`; `detail` for upstream errors and unreadable script keys |
+| Pre-service denial (`deny`)               | `ts`, `event`, `reason`, `source_ip`, `request_id`                                                                                              |
+| Unhandled error (`error`)                 | `ts`, `event`, `reason`, `detail`, `source_ip`, `request_id`                                                                                    |
 
 - `cache` is `hit` when the broker reused a cached token and `miss` when it minted a new one.
 - `reason` comes from a fixed set and never contains caller-supplied text: `missing_authorization`,
@@ -369,8 +383,9 @@ SHA-256 digest.
   `not_found`, `method_not_allowed`, `upstream_error`, or `internal_error`.
 - A caller-supplied `client_id` longer than 64 characters is truncated and marked with
   `client_id_truncated`. An unrecognized `scope` or `token_type` is recorded as `invalid`.
-- `detail` appears on upstream errors, where it briefly describes the SG failure, and on unhandled
-  errors, where it names only the exception class.
+- `detail` appears on upstream errors, where it briefly describes the SG failure; on errors reading
+  a script key, where it names the variable or file but never the key; and on unhandled errors,
+  where it names only the exception class.
 - `source_ip` is the address of the peer connected to the broker. The broker does not read
   `X-Forwarded-For`, so behind a reverse proxy every record shows the proxy's address: `127.0.0.1`
   in the recommended same-host layout. Keep the proxy's access log; it records each request's
@@ -438,8 +453,9 @@ and accepts the same options and exit codes.
 ## Configuration reference
 
 `broker.yml` is a YAML mapping with the keys below. It must define at least one scope and one
-client. Integer values must be plain YAML integers, because quoted numbers and booleans such as
-`yes` are rejected, and durations and rate limits must be positive.
+client. Any other key is an error, so a misspelled key such as `token_type` fails `check-config`
+instead of being ignored. Integer values must be plain YAML integers, because quoted numbers and
+booleans such as `yes` are rejected, and durations and rate limits must be positive.
 
 | Key                                  | Default                          | Description                                                                                         |
 | ------------------------------------ | -------------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -450,12 +466,24 @@ client. Integer values must be plain YAML integers, because quoted numbers and b
 | `server.tls.key_file`                | None                             | Private-key file for in-process TLS.                                                                |
 | `defaults.session_ttl_seconds`       | `600`                            | How long the broker reuses a cached session token, and the session `expires_at` it reports.         |
 | `defaults.rate_limit_per_minute`     | `60`                             | Default per-client request limit for each minute.                                                   |
+| `defaults.token_types`               | `[session, rest]`                | Default token types that each client may request.                                                   |
 | `scopes.<name>.script_name`          | Required                         | SG script account name for the scope.                                                               |
 | `scopes.<name>.script_key_file`      | One of two                       | File containing the script account's application key; surrounding whitespace is ignored.            |
 | `scopes.<name>.script_key_env`       | One of two                       | Environment variable containing the key. Set exactly one of `script_key_file` and `script_key_env`. |
 | `clients.<id>.secret_hash`           | Required                         | Hash printed by `hash-secret`.                                                                      |
 | `clients.<id>.scopes`                | Required                         | Non-empty list of configured scope names that the client may request.                               |
 | `clients.<id>.rate_limit_per_minute` | `defaults.rate_limit_per_minute` | Request limit for this client for each minute.                                                      |
+| `clients.<id>.token_types`           | `defaults.token_types`           | Non-empty list of the token types, `session` and `rest`, that the client may request.               |
+
+### Client credentials
+
+Clients send their credentials in an HTTP Basic `Authorization` header, which limits the characters
+they can contain. A client ID has 1 to 64 characters from the printable ASCII range 0x21-0x7E,
+excluding `:`. A client secret is a non-empty string from the same range. Spaces and non-ASCII
+characters are invalid in either.
+
+Stored hashes must use the scrypt parameters, salt length, and digest length emitted by
+`sg-token-broker hash-secret`.
 
 ## HTTP API reference
 
@@ -483,7 +511,7 @@ Error responses are JSON objects with `error` and `detail` fields:
 | ------ | -------------------- | --------------------------------------------------------------------------- |
 | 400    | `bad_request`        | Malformed request or body, an unknown `token_type`, or a body sent with GET |
 | 401    | `invalid_client`     | Missing, malformed, unknown, or wrong client credentials                    |
-| 403    | `forbidden`          | The client may not use the requested scope                                  |
+| 403    | `forbidden`          | The client may not use the requested scope or token type                    |
 | 404    | `not_found`          | Unknown path                                                                |
 | 405    | `method_not_allowed` | Unsupported method for the path                                             |
 | 413    | `payload_too_large`  | Body larger than 8192 bytes                                                 |

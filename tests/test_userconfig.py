@@ -7,7 +7,7 @@ from sg_token_broker._userconfig import UserConfigError, load_user_token_config
 
 _ENV_PREFIX = _userconfig._ENV_PREFIX
 
-REQUIRED = ('SITE_URL', 'SCRIPT_NAME', 'SCRIPT_KEY', 'AUDIENCES', 'ALLOWED_DOMAIN')
+_REQUIRED = ('SITE_URL', 'SCRIPT_NAME', 'SCRIPT_KEY', 'AUDIENCES', 'ALLOWED_DOMAIN')
 
 
 class TestLoadUserTokenConfig:
@@ -19,6 +19,23 @@ class TestLoadUserTokenConfig:
     def test_assume_email_verified_true(self) -> None:
         env = _make_env(**{f'{_ENV_PREFIX}_ASSUME_EMAIL_VERIFIED': ' TrUe '})
         assert load_user_token_config(env).assume_email_verified is True
+
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [(None, ''), ('  ', ''), ('127.0.0.1', '127.0.0.1'), ('::1', '::1')],
+    )
+    def test_bind_defaults_or_accepts_ip_address(self, raw: str | None, expected: str) -> None:
+        env = _make_env()
+        if raw is not None:
+            env['SGUT_BIND'] = raw
+        assert load_user_token_config(env).bind == expected
+
+    @pytest.mark.parametrize('raw', ['localhost', '999.1.1.1'])
+    def test_bind_rejects_non_ip_address(self, raw: str) -> None:
+        with pytest.raises(UserConfigError) as exc_info:
+            load_user_token_config(_make_env(SGUT_BIND=raw))
+        assert str(exc_info.value) == f'SGUT_BIND must be an IP address; got {raw!r}'
+        assert isinstance(exc_info.value.__cause__, ValueError)
 
     def test_blank_audience_list_fails(self) -> None:
         with pytest.raises(UserConfigError, match='AUDIENCES'):
@@ -48,7 +65,7 @@ class TestLoadUserTokenConfig:
         env = _make_env(**{f'{_ENV_PREFIX}_SITE_URL': 'http://127.0.0.1:8080'})
         assert load_user_token_config(env).site_url == 'http://127.0.0.1:8080'
 
-    @pytest.mark.parametrize('name', REQUIRED)
+    @pytest.mark.parametrize('name', _REQUIRED)
     def test_missing_variable_fails(self, name: str) -> None:
         env = _make_env()
         del env[f'{_ENV_PREFIX}_{name}']

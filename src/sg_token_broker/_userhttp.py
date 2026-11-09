@@ -1,7 +1,5 @@
 """Stdlib HTTP layer for the user-token service."""
 
-# pyright: reportPrivateUsage=false
-
 import ipaddress
 import logging
 from http.server import BaseHTTPRequestHandler
@@ -32,16 +30,7 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
     server_version = 'sg-user-tokens'
     sys_version = ''
     timeout = _REQUEST_TIMEOUT_SECONDS
-    access_logger = _LOG
-
-    def _deny(self, request_id: str, reason: str, status: int, body: dict[str, object]) -> None:
-        """Audit a pre-service denial, then answer it."""
-        cast('_UserTokenHTTPServer', self.server)._service.log_denied_request(
-            reason=reason,
-            source_ip=self.client_address[0],
-            request_id=request_id,
-        )
-        respond(self, status, body)
+    _access_logger = _LOG
 
     def _has_body(self) -> bool:
         """Return whether the GET request declares a body or invalid framing."""
@@ -66,6 +55,35 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
             raise ValueError(f'repeated query parameter {name!r}')
         return values[0]
 
+    def _source_ip(self) -> str:
+        """Return the audited client address, trusting X-Forwarded-For only from proxies."""
+        peer_address = self.client_address[0]
+        try:
+            peer = normalize_ip(peer_address)
+        except ValueError:
+            return peer_address
+        if peer not in cast('_UserTokenHTTPServer', self.server).trusted_proxies:
+            return peer_address
+        forwarded = ','.join(self.headers.get_all('X-Forwarded-For') or [])
+        return forwarded.rsplit(',', 1)[-1].strip() or peer_address
+
+    def _deny(self, request_id: str, reason: str, status: int, body: dict[str, object]) -> None:
+        """Audit a pre-service denial, then answer it."""
+        cast('_UserTokenHTTPServer', self.server).service.log_denied_request(
+            reason=reason,
+            source_ip=self._source_ip(),
+            request_id=request_id,
+        )
+        respond(self, status, body)
+
+    def _log_denial(self, reason: str) -> None:
+        """Audit a denial the stdlib answered before routing."""
+        cast('_UserTokenHTTPServer', self.server).service.log_denied_request(
+            reason=reason,
+            source_ip=self._source_ip(),
+            request_id=new_request_id(),
+        )
+
     def _serve_user_token(self, query: str, request_id: str) -> None:
         """Serve GET /v1/user-token."""
         server = cast('_UserTokenHTTPServer', self.server)
@@ -81,29 +99,20 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
                 {'error': 'bad_request', 'detail': str(exc)},
             )
             return
-        source_ip = self.client_address[0]
-        try:
-            peer = normalize_ip(source_ip)
-        except ValueError:
-            peer = None
-        if peer is not None and peer in server._trusted_proxies:
-            forwarded_values = self.headers.get_all('X-Forwarded-For') or []
-            forwarded = ','.join(forwarded_values)
-            source_ip = forwarded.rsplit(',', 1)[-1].strip() or source_ip
         request = UserTokenRequest(
             authorization=self.headers.get('Authorization', ''),
-            source_ip=source_ip,
+            source_ip=self._source_ip(),
             request_id=request_id,
             token_type=token_type,
             refresh=refresh_raw == 'true',
         )
         try:
-            issued = server._service.issue_token(request)
+            issued = server.service.issue_token(request)
         except UserTokenError as exc:
             respond(self, exc.status, {'error': exc.error, 'detail': str(exc)})
             return
         except Exception as exc:  # noqa: BLE001 - spec: unexpected errors become an opaque 500
-            server._service.log_unhandled(request, exc)
+            server.service.log_unhandled(request, exc)
             _LOG.exception('unhandled error issuing user token')
             respond(self, 500, {'error': 'internal_error', 'detail': 'internal error'})
             return
@@ -121,7 +130,11 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
         )
 
     def do_GET(self) -> None:
-        """Route GET requests."""
+        """Route GET requests.
+
+        Raises:
+            OSError: If the HTTP response cannot be written.
+        """
         request_id = new_request_id()
         if self._has_body():
             self._deny(
@@ -154,23 +167,11 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
             {'error': 'not_found', 'detail': 'unknown path'},
         )
 
-    def log_denial(self, reason: str) -> None:
-        """Audit a denial the stdlib answered before routing.
-
-        Args:
-            reason: Stable audit reason for the denial.
-        """
-        cast('_UserTokenHTTPServer', self.server)._service.log_denied_request(
-            reason=reason,
-            source_ip=self.client_address[0],
-            request_id=new_request_id(),
-        )
-
 
 class _UserTokenHTTPServer(BoundedThreadingHTTPServer):
     """Threading HTTP server carrying the user-token service reference."""
 
-    error_logger = _LOG
+    _error_logger = _LOG
 
     def __init__(
         self,
@@ -180,8 +181,8 @@ class _UserTokenHTTPServer(BoundedThreadingHTTPServer):
     ) -> None:
         """Bind `address` with the user-token service and trusted proxies."""
         super().__init__(address, _Handler)
-        self._service = service
-        self._trusted_proxies = trusted_proxies
+        self.service = service
+        self.trusted_proxies = trusted_proxies
 
 
 def create_user_token_server(

@@ -11,7 +11,7 @@ import pytest
 
 from tests.cli_helpers import process_transcript, run_cli, run_setup
 
-ROOT = Path(__file__).resolve().parents[1]
+_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _assert_extracted_wheel(installed: Path, expected_version: str) -> None:
@@ -39,9 +39,9 @@ def _build(project: Path, target: str) -> Path:
 def _copy_project(destination: Path) -> None:
     destination.mkdir()
     for name in ('pyproject.toml', 'README.md', 'LICENSE'):
-        shutil.copy2(ROOT / name, destination / name)
+        shutil.copy2(_ROOT / name, destination / name)
     shutil.copytree(
-        ROOT / 'src',
+        _ROOT / 'src',
         destination / 'src',
         ignore=shutil.ignore_patterns('__pycache__', '*.pyc'),
     )

@@ -1,8 +1,9 @@
 # sg-token-broker
 
-sg-token-broker lets pipeline tools call Autodesk Flow Production Tracking without receiving
-long-lived API script keys. A service you run keeps the keys, checks each caller, and issues an SG
-token with the permissions of a configured script account or of the signed-in person.
+sg-token-broker lets pipeline tools call Autodesk Flow Production Tracking without holding API
+script keys. A service you run keeps the keys, checks each caller's broker credential or sign-in,
+and issues an SG token with the permissions of a configured script account or of the signed-in
+person.
 
 Use it when farm jobs, pipeline services, desktop tools, or Google Sheets need SG access and you
 want to keep script keys on one host, limit which SG identities each caller can use, and record
@@ -14,9 +15,9 @@ This documentation uses SG for Flow Production Tracking, formerly named Shotgun 
 
 Choose by whose permissions SG should enforce:
 
-- **App-token broker:** for farm jobs, pipeline services, and shared tools. Each named *scope* maps
-  to an SG script account with a limited permission role, and each consuming system gets its own
-  broker credential.
+- **App-token broker:** for farm jobs, pipeline services, and other unattended tools on hosts you
+  control. Each named *scope* maps to an SG script account with a limited permission role, and each
+  consuming system gets its own broker credential.
 - **User-token service:** for tools that act as the signed-in person. The service verifies the
   person's studio sign-in and issues a token bound to their own SG account.
 
@@ -55,6 +56,10 @@ This walkthrough runs the app-token broker on your machine and fetches a token f
 ask an SG administrator to create a script account, such as `broker_read_all`, whose permission
 role grants only what your tool needs. Only the broker uses that account's application key.
 
+A shared deployment has three roles: an SG administrator creates script accounts, a broker operator
+runs the broker and creates a credential for each consuming system, and each system's developers
+configure it with that credential. In this walkthrough, you play all three.
+
 ### Create a client credential
 
 ```sh
@@ -62,7 +67,9 @@ sg-token-broker hash-secret
 ```
 
 The command prints a `secret:` line for the consuming tool and a `hash:` line for the broker
-configuration. The broker stores only the hash.
+configuration. The broker stores only the hash. Creating credentials is the operator's job; a
+consuming tool cannot make its own. The secret works from any host that can reach the broker until
+the operator removes the client, so protect it like a password.
 
 ### Configure the broker
 
@@ -147,15 +154,16 @@ If your administrator already runs the service, start with
 
 ## Documentation
 
-| If you want to...                                                | Read                                                            |
-| ---------------------------------------------------------------- | --------------------------------------------------------------- |
-| Choose between app and user tokens, or session and REST tokens   | [Choosing a credential](docs/modes.md)                          |
-| Deploy, operate, or troubleshoot the app-token broker            | [App-token broker deployment](docs/deployment.md)               |
-| Deploy the user-token service                                    | [User-token service](docs/user-token-service.md)                |
-| Connect a desktop tool or Google Sheet to the user-token service | [Client setup](docs/user-token-service.md#desktop-client-setup) |
-| Handle token expiry or respond to a leaked credential            | [Token lifetime and revocation](docs/sg-token-behavior.md)      |
-| Understand the security boundaries and their limits              | [Design and security](docs/design.md)                           |
-| See changes by version                                           | [Changelog](CHANGELOG.md)                                       |
+| If you want to...                                              | Read                                                                    |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Choose between app and user tokens, or session and REST tokens | [Choosing a credential](docs/modes.md)                                  |
+| Deploy, operate, or troubleshoot the app-token broker          | [App-token broker deployment](docs/deployment.md)                       |
+| Deploy the user-token service                                  | [User-token service](docs/user-token-service.md)                        |
+| Connect a desktop tool to the user-token service               | [Desktop client setup](docs/user-token-service.md#desktop-client-setup) |
+| Connect a Google Sheet to the user-token service               | [Apps Script caller](docs/user-token-service.md#apps-script-caller)     |
+| Handle token expiry or respond to a leaked credential          | [Token lifetime and revocation](docs/sg-token-behavior.md)              |
+| Understand the security boundaries and their limits            | [Design and security](docs/design.md)                                   |
+| See changes by version                                         | [Changelog](CHANGELOG.md)                                               |
 
 ## Development
 

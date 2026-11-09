@@ -9,7 +9,7 @@ Usage:
     export SGTB_VERIFY_KEY=<application key>
     python verify_sg_revocation.py --site-url https://studio.shotgunstudio.com
         --script-name disposable_revocation_test --script-key-env SGTB_VERIFY_KEY
-        --proxy http://squid:8080 --ca-bundle /path/to/corp-root-ca.pem
+        --proxy http://proxy.example:3128 --ca-bundle /path/to/corp-root-ca.pem
     (single command line; wrapped here for readability)
 
 Networks with a TLS-intercepting proxy re-sign the site's certificate with a
@@ -32,6 +32,7 @@ import re
 import sys
 import warnings
 from collections.abc import Iterable
+from pathlib import Path
 from typing import TypeAlias, cast
 from urllib.parse import urlsplit
 
@@ -102,6 +103,19 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+def _readable_ca_bundle(value: str) -> str:
+    """Require a readable CA bundle file before sending any requests."""
+    path = Path(value)
+    try:
+        if not path.is_file():
+            raise argparse.ArgumentTypeError(f'no readable CA bundle at {value}')
+        with path.open('rb'):
+            pass
+    except OSError as exc:
+        raise argparse.ArgumentTypeError(f'no readable CA bundle at {value}') from exc
+    return value
+
+
 def _report_error(message: str) -> None:
     """Print an anticipated error on one terminal-safe stderr line."""
     message = message.replace(f'\nhint: {_SSL_HINT}.', f'; {_SSL_HINT}')
@@ -147,6 +161,8 @@ def _rest_token_expires_in(
         data: object = response.json()
     except (requests.RequestException, ValueError):
         return None
+    except OSError as exc:
+        raise RuntimeError(f'cannot send the SG request: {exc}') from exc
     if isinstance(data, dict):
         expires = cast('dict[str, object]', data).get('expires_in')
         if isinstance(expires, int):
@@ -168,6 +184,8 @@ def _rpc_get_session_token(
         )
     except requests.RequestException as exc:
         raise RuntimeError(f'cannot reach SG site: {_describe(exc)}') from exc
+    except OSError as exc:
+        raise RuntimeError(f'cannot send the SG request: {exc}') from exc
     try:
         data: object = response.json()
     except ValueError as exc:
@@ -238,8 +256,8 @@ def _verify_restore(session: requests.Session, site_url: str, script_name: str, 
     if not _check_session_token(session, site_url, token):
         print('Passed: tokens stay dead after the script is restored.')
         print(
-            'Retirement procedure: rotate the key FIRST (not possible while trashed), '
-            'then trash the script, then restore it.'
+            'Retirement procedure for a leaked scope: rotate the key FIRST (not possible while '
+            'trashed), then trash the script, then restore it.'
         )
         return 0
 
@@ -279,7 +297,7 @@ def _run_test(session: requests.Session, site_url: str, script_name: str, key: s
     """Run the interactive mint/rotate/disable flow; returns the exit code."""
     minted, error = _mint_session_token(session, site_url, script_name, key)
     if minted is None:
-        _report_error(f'sg rejected the script credentials: {error}')
+        _report_error(f'could not mint a session token: {error}')
         return 2
     if not _check_session_token(session, site_url, minted):
         _report_error('freshly minted session token did not validate')
@@ -290,6 +308,8 @@ def _run_test(session: requests.Session, site_url: str, script_name: str, key: s
     expires = _rest_token_expires_in(session, site_url, script_name, key)
     if expires is not None:
         print(f'Note: REST access tokens on this site expire in {expires}s (site pref).')
+    else:
+        print('Note: REST access token mint failed; continuing with the session test.')
 
     input(
         f'Step 1: In SG Admin > Scripts, regenerate the application key for '
@@ -327,19 +347,8 @@ def _run_test(session: requests.Session, site_url: str, script_name: str, key: s
         )
 
 
-def main(argv: Iterable[str] | None = None) -> int:
-    """Run the interactive revocation test.
-
-    Args:
-        argv: Arguments (defaults to `sys.argv[1:]`).
-
-    Returns:
-        Process exit code (0 revocable, 1 not revocable, 2 setup or
-        inconclusive SG error, 3 unverified).
-
-    Raises:
-        SystemExit: With status 0 for help or 2 for invalid arguments.
-    """
+def _main(argv: Iterable[str] | None = None) -> int:
+    """Run the interactive revocation test."""
     parser = argparse.ArgumentParser(
         description=(__doc__ or '').splitlines()[0],
         epilog='Exit status: 0 if a procedure retired the token immediately, 1 if the token '
@@ -362,11 +371,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument(
         '--proxy',
         metavar='URL',
-        help='HTTP(S) proxy URL, e.g. http://squid:8080 '
+        help='HTTP(S) proxy URL, e.g. http://proxy.example:3128 '
         '(HTTP_PROXY/HTTPS_PROXY env vars are honored without this flag)',
     )
     parser.add_argument(
         '--ca-bundle',
+        type=_readable_ca_bundle,
         metavar='FILE',
         help='CA bundle file for TLS verification, e.g. the corporate root CA when the '
         'proxy intercepts TLS (REQUESTS_CA_BUNDLE env var is honored without this flag)',
@@ -407,4 +417,4 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(_main())

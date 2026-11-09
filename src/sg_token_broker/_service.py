@@ -1,6 +1,7 @@
 """Authenticate, authorize, mint, and audit broker token requests."""
 
 import datetime
+import functools
 import threading
 import time
 from collections.abc import Callable
@@ -19,9 +20,6 @@ from sg_token_broker._secrets import (
 )
 from sg_token_broker._sg import MintedToken, SGError
 
-# Verified when the client_id is unknown so that unknown and known clients take
-# the same scrypt time (no client-id enumeration via timing).
-_DUMMY_HASH = hash_secret('timing-equalizer')
 _RATE_WINDOW_SECONDS = 60.0
 _REST_CACHE_TTL_SECONDS = 60.0
 _REST_EXPIRY_MARGIN_SECONDS = 60
@@ -59,18 +57,11 @@ class InvalidClientError(BrokerError):
 
 
 @dataclass(frozen=True)
-class IssuedToken:
-    """Represent a token issued to a client.
+class _IssuedToken:
+    """Represent a token issued to a client."""
 
-    Attributes:
-        token: Issued token credential.
-        token_type: Issued token type, `session` or `rest`.
-        scope: Broker scope authorized for the token.
-        site_url: Base URL of the SG site.
-        expires_at: Broker refresh deadline. For REST tokens it is derived from
-            SG's reported lifetime with a safety margin; for sessions it is an
-            advisory reuse deadline, not an SG expiration.
-    """
+    # REST expiry uses SG's reported lifetime with a safety margin. Session
+    # expiry is only an advisory reuse deadline, not an SG expiration.
 
     token: str = field(repr=False)
     token_type: str
@@ -102,7 +93,7 @@ class TokenRequest:
 
 
 class _ForbiddenError(BrokerError):
-    """The authenticated client may not use the requested scope."""
+    """The authenticated client may not use the requested scope or token type."""
 
     status = 403
     error = 'forbidden'
@@ -165,23 +156,28 @@ class BrokerService:
         self._cache = cache
         self._audit = audit
         self._rate_limiter = _RateLimiter()
+        _dummy_hash()  # Pay the one-time hash before serving, not on the first unknown client.
 
-    def _issue(self, request: TokenRequest) -> tuple[IssuedToken, bool]:
-        """Run the authenticate, authorize, mint pipeline."""
+    def _authorize(self, request: TokenRequest) -> None:
+        """Authenticate the client, then enforce its rate limit, scopes, and token types."""
         client = self._config.clients.get(request.client_id)
         if client is None:
-            verify_secret(request.client_secret, _DUMMY_HASH)
+            verify_secret(request.client_secret, _dummy_hash())
             raise InvalidClientError('unknown client or bad secret')
         if not verify_secret(request.client_secret, client.secret_hash):
             raise InvalidClientError('unknown client or bad secret')
-        if not self._rate_limiter._check(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-            client.client_id, client.rate_limit_per_minute
-        ):
+        if not self._rate_limiter.check(client.client_id, client.rate_limit_per_minute):
             raise _RateLimitedError('per-client rate limit exceeded')
         if request.token_type not in (_SESSION_TYPE, _REST_TYPE):
             raise BadRequestError(f'unknown token_type {request.token_type!r}')
         if request.scope not in client.scopes:
             raise _ForbiddenError(f'scope {request.scope!r} not allowed for this client')
+        if request.token_type not in client.token_types:
+            raise _ForbiddenError(f'token_type {request.token_type!r} not allowed for this client')
+
+    def _issue(self, request: TokenRequest) -> tuple[_IssuedToken, bool]:
+        """Run the authenticate, authorize, mint pipeline."""
+        self._authorize(request)
         scope = self._config.scopes[request.scope]
 
         session_ttl = float(self._config.session_ttl_seconds)
@@ -214,7 +210,7 @@ class BrokerService:
             (minted, expires_at), cache_hit = self._cache.get_or_create(
                 cache_key, session_ttl, mint
             )
-        issued = IssuedToken(
+        issued = _IssuedToken(
             token=minted.token,
             token_type=request.token_type,
             scope=request.scope,
@@ -223,7 +219,7 @@ class BrokerService:
         )
         return issued, cache_hit
 
-    def issue_token(self, request: TokenRequest) -> IssuedToken:
+    def issue_token(self, request: TokenRequest) -> _IssuedToken:
         """Issue a token for an authenticated, authorized client request.
 
         Args:
@@ -243,6 +239,8 @@ class BrokerService:
             extra: dict[str, object] = {}
             if isinstance(exc, _UpstreamError):
                 extra['detail'] = str(exc.__cause__ or exc)
+            elif isinstance(exc.__cause__, SecretError):
+                extra['detail'] = str(exc.__cause__)
             self._audit.log(
                 'deny' if exc.status < threshold else 'error',
                 **_audit_client_id(request.client_id),
@@ -303,6 +301,24 @@ class BrokerService:
         )
 
 
+def _audit_client_id(client_id: str) -> dict[str, object]:
+    """Bound a caller-supplied client id for the audit log."""
+    if len(client_id) <= CLIENT_ID_MAX_CHARS:
+        return {'client_id': client_id}
+    return {
+        'client_id': client_id[:CLIENT_ID_MAX_CHARS],
+        'client_id_truncated': True,
+    }
+
+
+@functools.cache
+def _dummy_hash() -> str:
+    """Return the scrypt hash verified for unknown client ids, computed once per process."""
+    # Unknown and known clients take the same scrypt time, so timing cannot
+    # enumerate client ids. Only the broker needs it, so CLI commands skip it.
+    return hash_secret('timing-equalizer')
+
+
 class _RateLimitedError(BrokerError):
     """The client exceeded its per-minute request budget."""
 
@@ -319,8 +335,17 @@ class _RateLimiter:
         self._lock = threading.Lock()
         self._windows: dict[str, tuple[float, int]] = {}
 
-    def _check(self, client_id: str, limit: int) -> bool:
-        """Record one request; return False if the budget is exhausted."""
+    def check(self, client_id: str, limit: int) -> bool:
+        """Record one client request and report whether its window has capacity.
+
+        Args:
+            client_id: Client whose requests share a rate window.
+            limit: Maximum requests allowed in the window.
+
+        Returns:
+            Whether this request was accepted within the client's current
+            window.
+        """
         now = self._clock()
         with self._lock:
             start, count = self._windows.get(client_id, (now, 0))
@@ -338,16 +363,6 @@ class _UpstreamError(BrokerError):
 
     status = 502
     error = 'upstream_error'
-
-
-def _audit_client_id(client_id: str) -> dict[str, object]:
-    """Bound a caller-supplied client id for the audit log."""
-    if len(client_id) <= CLIENT_ID_MAX_CHARS:
-        return {'client_id': client_id}
-    return {
-        'client_id': client_id[:CLIENT_ID_MAX_CHARS],
-        'client_id_truncated': True,
-    }
 
 
 def _resolve_scope_key(scope: ScopeConfig) -> str:

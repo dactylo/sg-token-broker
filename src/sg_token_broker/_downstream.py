@@ -15,7 +15,7 @@ class _ClosableTextOutput:
 
     def __init__(self, stream: TextIO, *, windows: bool | None = None) -> None:
         """Wrap a text stream and select closed-pipe handling for its platform."""
-        self._closed_downstream = False
+        self.closed_downstream = False
         self._stream = stream
         self._windows = windows
 
@@ -29,14 +29,14 @@ class _ClosableTextOutput:
         Raises:
             OSError: If flushing fails for a reason other than closure.
         """
-        if self._closed_downstream:
+        if self.closed_downstream:
             return
         try:
             self._stream.flush()
         except OSError as error:
             if not _is_downstream_closure(error, windows=self._windows):
                 raise
-            self._closed_downstream = True
+            self.closed_downstream = True
 
     def write(self, text: str) -> int:
         """Write text, or discard it after the reader has closed.
@@ -50,14 +50,14 @@ class _ClosableTextOutput:
         Raises:
             OSError: If writing fails for a reason other than closure.
         """
-        if self._closed_downstream:
+        if self.closed_downstream:
             return len(text)
         try:
             return self._stream.write(text)
         except OSError as error:
             if not _is_downstream_closure(error, windows=self._windows):
                 raise
-            self._closed_downstream = True
+            self.closed_downstream = True
             return len(text)
 
     def writelines(self, lines: Iterable[str]) -> None:
@@ -69,11 +69,11 @@ class _ClosableTextOutput:
         Raises:
             OSError: If writing fails for a reason other than closure.
         """
-        if self._closed_downstream:
+        if self.closed_downstream:
             return
         for line in lines:
             self.write(line)
-            if self._closed_downstream:
+            if self.closed_downstream:
                 return
 
 
@@ -123,6 +123,10 @@ def closable_stdout() -> Generator[_ClosableTextOutput, None, None]:
 
     Yields:
         The installed wrapper.
+
+    Raises:
+        OSError: If flushing fails for a reason other than downstream closure,
+            or if opening or redirecting to the null device fails.
     """
     original = sys.stdout
     output = _ClosableTextOutput(original)
@@ -134,10 +138,7 @@ def closable_stdout() -> Generator[_ClosableTextOutput, None, None]:
             output.flush()
         finally:
             sys.stdout = original
-            if (
-                output._closed_downstream  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-                and not _silence_descriptor(original)
-            ):
+            if output.closed_downstream and not _silence_descriptor(original):
                 # The interpreter still flushes a stream without a descriptor
                 # at shutdown, so replace it with one that cannot fail.
                 sys.stdout = _null_text_stream()

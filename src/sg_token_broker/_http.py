@@ -1,13 +1,9 @@
 """Serve broker routes through the standard-library HTTP stack."""
 
-# pyright: reportPrivateUsage=false
-
 import base64
 import binascii
-import ipaddress
 import json
 import logging
-import socket
 import ssl
 from http.server import BaseHTTPRequestHandler
 from typing import cast
@@ -40,20 +36,12 @@ _LOG = logging.getLogger(_SERVER_LOGGER_NAME)
 class _BrokerHTTPServer(BoundedThreadingHTTPServer):
     """Serve broker requests for `service` at `address`."""
 
-    error_logger = _LOG
+    _error_logger = _LOG
 
     def __init__(self, address: tuple[str, int], service: BrokerService) -> None:
         """Bind `address` and attach the broker service."""
-        try:
-            host = ipaddress.ip_address(address[0])
-        except ValueError:
-            self.address_family = socket.AF_INET
-        else:
-            self.address_family = (
-                socket.AF_INET6 if isinstance(host, ipaddress.IPv6Address) else socket.AF_INET
-            )
         super().__init__(address, _Handler)
-        self._service = service
+        self.service = service
 
 
 class _PayloadTooLargeError(BrokerError):
@@ -70,11 +58,21 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
     server_version = 'sg-token-broker'
     sys_version = ''
     timeout = _REQUEST_TIMEOUT_SECONDS
-    access_logger = _LOG
+    _access_logger = _LOG
+
+    def _answer_unhandled(self, request_id: str, exc: Exception) -> None:
+        """Audit an unexpected token request error and answer opaquely."""
+        cast('_BrokerHTTPServer', self.server).service.log_unhandled(
+            source_ip=self.client_address[0],
+            request_id=request_id,
+            exc=exc,
+        )
+        _LOG.exception('unhandled error handling token request')
+        respond(self, 500, {'error': 'internal_error', 'detail': 'internal error'})
 
     def _deny(self, request_id: str, reason: str, status: int, body: dict[str, object]) -> None:
         """Audit a pre-service denial, then answer it."""
-        cast('_BrokerHTTPServer', self.server)._service.log_denied_request(
+        cast('_BrokerHTTPServer', self.server).service.log_denied_request(
             reason=reason,
             source_ip=self.client_address[0],
             request_id=request_id,
@@ -92,6 +90,14 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
             if not chunk:
                 return
             remaining -= len(chunk)
+
+    def _log_denial(self, reason: str) -> None:
+        """Audit a denial the stdlib answered before routing."""
+        cast('_BrokerHTTPServer', self.server).service.log_denied_request(
+            reason=reason,
+            source_ip=self.client_address[0],
+            request_id=new_request_id(),
+        )
 
     def _parse_basic_auth(self) -> tuple[str, str]:
         """Extract client credentials from the Authorization header."""
@@ -178,7 +184,11 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
             return None
 
     def do_GET(self) -> None:
-        """Serve the unauthenticated health check."""
+        """Serve the unauthenticated health check.
+
+        Raises:
+            OSError: If the HTTP response cannot be written.
+        """
         request_id = new_request_id()
         path = self._route(request_id)
         if path is None:
@@ -213,7 +223,11 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
         )
 
     def do_POST(self) -> None:
-        """Serve POST /v1/token."""
+        """Serve POST /v1/token.
+
+        Raises:
+            OSError: If the HTTP response cannot be written.
+        """
         request_id = new_request_id()
         path = self._route(request_id)
         if path is None:
@@ -250,16 +264,10 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
             )
             return
         except Exception as exc:  # noqa: BLE001 - spec: unexpected errors become an opaque 500
-            broker_server._service.log_unhandled(
-                source_ip=self.client_address[0],
-                request_id=request_id,
-                exc=exc,
-            )
-            _LOG.exception('unhandled error issuing token')
-            respond(self, 500, {'error': 'internal_error', 'detail': 'internal error'})
+            self._answer_unhandled(request_id, exc)
             return
         try:
-            issued = broker_server._service.issue_token(request)
+            issued = broker_server.service.issue_token(request)
         except BrokerError as exc:
             respond(
                 self,
@@ -267,13 +275,7 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
                 {'error': exc.error, 'detail': str(exc)},
             )
         except Exception as exc:  # noqa: BLE001 - spec: unexpected errors become an opaque 500
-            broker_server._service.log_unhandled(
-                source_ip=self.client_address[0],
-                request_id=request_id,
-                exc=exc,
-            )
-            _LOG.exception('unhandled error issuing token')
-            respond(self, 500, {'error': 'internal_error', 'detail': 'internal error'})
+            self._answer_unhandled(request_id, exc)
         else:
             respond(
                 self,
@@ -286,18 +288,6 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
                     'expires_at': issued.expires_at.isoformat(),
                 },
             )
-
-    def log_denial(self, reason: str) -> None:
-        """Audit a denial the stdlib answered before routing.
-
-        Args:
-            reason: Stable audit reason for the denial.
-        """
-        cast('_BrokerHTTPServer', self.server)._service.log_denied_request(
-            reason=reason,
-            source_ip=self.client_address[0],
-            request_id=new_request_id(),
-        )
 
 
 def create_server(config: BrokerConfig, service: BrokerService) -> _BrokerHTTPServer:

@@ -123,6 +123,8 @@ class SGMinter:
             )
         except requests.RequestException as exc:
             raise SGError(f'SG request to {path} failed: {exc.__class__.__name__}') from exc
+        except OSError as exc:
+            raise SGError(f'SG request to {path} could not be sent: {exc}') from exc
         if response.status_code != HTTPStatus.OK:
             message = f'SG request to {path} returned HTTP {response.status_code}'
             title = _extract_error_title(response)

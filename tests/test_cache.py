@@ -1,11 +1,11 @@
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Generic, TypeVar
+from typing import TypeVar
 
 import pytest
 
-from sg_token_broker._cache import TTLCache
+from sg_token_broker._cache import TTLCache, _InFlight
 
 _T = TypeVar('_T')
 
@@ -177,8 +177,9 @@ class TestTTLCache:
         assert len(errors) == 5
         assert len({id(error) for error in errors}) == 1
 
+    @pytest.mark.parametrize('entry_point', ['get_or_create', 'revalidate_or_replace'])
     def test_failing_flight_remains_visible_until_failure_published(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, entry_point: str
     ) -> None:
         cache: TTLCache[str] = TTLCache()
         completion_started = threading.Event()
@@ -207,7 +208,8 @@ class TestTTLCache:
             return 'unexpected'
 
         owner_thread = threading.Thread(
-            target=_capture_cache_call, args=(cache, failing_factory, results, errors)
+            target=_capture_cache_call,
+            args=(cache, entry_point, failing_factory, results, errors),
         )
         owner_thread.start()
         assert factory_entered.wait(timeout=5)
@@ -216,7 +218,8 @@ class TestTTLCache:
 
         racer_started.set()
         racer_thread = threading.Thread(
-            target=_capture_cache_call, args=(cache, unexpected_factory, results, errors)
+            target=_capture_cache_call,
+            args=(cache, entry_point, unexpected_factory, results, errors),
         )
         racer_thread.start()
         assert racer_lookup.wait(timeout=5)
@@ -323,10 +326,14 @@ class TestTTLCache:
         assert validations == []
 
     def test_revalidate_keeps_live_value(self) -> None:
-        cache: TTLCache[str] = TTLCache()
+        now = [0.0]
+        cache: TTLCache[str] = TTLCache(clock=lambda: now[0])
         cache.get_or_create('k', 60.0, lambda: 'old')
+        now[0] = 30.0
         value, kept = cache.revalidate_or_replace('k', 60.0, lambda _: True, lambda: 'new')
         assert (value, kept) == ('old', True)
+        now[0] = 60.0
+        assert cache.get_or_create('k', 60.0, lambda: 'new') == ('new', False)
 
     def test_revalidate_replaces_dead_value(self) -> None:
         cache: TTLCache[str] = TTLCache()
@@ -376,12 +383,16 @@ class TestTTLCache:
 
 def _capture_cache_call(
     cache: TTLCache[str],
+    entry_point: str,
     factory: Callable[[], str],
     results: list[tuple[str, bool]],
     errors: list[BaseException],
 ) -> None:
     try:
-        results.append(cache.get_or_create('k', 60.0, factory))
+        if entry_point == 'get_or_create':
+            results.append(cache.get_or_create('k', 60.0, factory))
+        else:
+            results.append(cache.revalidate_or_replace('k', 60.0, lambda _value: True, factory))
     except RuntimeError as exc:
         errors.append(exc)
 
@@ -395,20 +406,20 @@ def _make_observed_flights(
 
     class ObservedFlights:
         def __init__(self) -> None:
-            self.entries: dict[object, object] = {}
-            self.waiters = 0
+            self._entries: dict[object, object] = {}
+            self._waiters = 0
 
         def __delitem__(self, key: object) -> None:
-            del self.entries[key]
+            del self._entries[key]
 
         def __setitem__(self, key: object, value: object) -> None:
-            self.entries[key] = value
+            self._entries[key] = value
 
         def get(self, key: object) -> object | None:
-            flight = self.entries.get(key)
+            flight = self._entries.get(key)
             if flight is not None and racer_started.is_set():
-                self.waiters += 1
-                if self.waiters == expected_waiters:
+                self._waiters += 1
+                if self._waiters == expected_waiters:
                     racer_lookup.set()
             return flight
 
@@ -425,11 +436,9 @@ def _make_test_flight(
             release_completion.wait(timeout=5)
             super().set()
 
-    class TestFlight(Generic[_T]):
+    class TestFlight(_InFlight[_T]):
         def __init__(self) -> None:
-            self._done = PausingEvent()
-            self._error: BaseException | None = None
-            self._kept: bool | None = None
-            self._value: _T | None = None
+            super().__init__()
+            self.done = PausingEvent()
 
     return TestFlight

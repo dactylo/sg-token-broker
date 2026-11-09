@@ -38,29 +38,21 @@ class ClaimsPolicy(Protocol):
 
         Raises:
             ClaimsError: If the presented identity is missing, invalid, or
-                disallowed. Provider failures must propagate separately.
+                disallowed.
+            Exception: If the identity provider cannot be queried; propagate
+                its operational failure separately from `ClaimsError`.
         """
         ...
 
 
 @dataclass(frozen=True)
-class IssuedUserToken:
-    """Represent a user-bound SG token ready for JSON serialization.
+class _IssuedUserToken:
+    """Represent a user-bound SG token ready for JSON serialization."""
 
-    `expires_at` is `None` for session tokens: a session has no scheduled
-    expiry (SG's sliding inactivity window governs). `cache_until` is the
-    service's caching hint: equal to `expires_at` for REST tokens, and the
-    same-token horizon for sessions.
-
-    Attributes:
-        token: Issued SG credential.
-        token_type: Issued token type, `rest` or `session`.
-        login: SG HumanUser login bound to the token.
-        site_url: Base URL of the SG site.
-        expires_at: REST refresh deadline derived from SG's lifetime minus a
-            safety margin, or `None` for a session token.
-        cache_until: Service-provided caching horizon.
-    """
+    # Sessions have no scheduled expiry; SG's sliding inactivity window
+    # governs them. REST expires_at includes a safety margin against SG's
+    # reported lifetime. cache_until is the service's caching hint: it equals
+    # expires_at for REST tokens and the same-token horizon for sessions.
 
     token: str = field(repr=False)
     token_type: str
@@ -74,15 +66,15 @@ class IssuedUserToken:
 class ServiceAccount:
     """Represent the sudo-capable service ApiUser and its SG site.
 
-    Args:
-        _site_url: Base URL of the SG site.
-        _script_name: Service ApiUser script name.
-        _script_key: Service ApiUser application key.
+    Attributes:
+        site_url: Base URL of the SG site.
+        script_name: Service ApiUser script name.
+        script_key: Service ApiUser application key.
     """
 
-    _site_url: str
-    _script_name: str
-    _script_key: str = field(repr=False)
+    site_url: str
+    script_name: str
+    script_key: str = field(repr=False)
 
 
 class UserTokenError(Exception):
@@ -230,9 +222,9 @@ class UserTokenService:
             session_ttl_seconds: Maximum service-cache lifetime for sessions.
                 Defaults to `600`.
         """
-        self._site_url = account._site_url.rstrip('/')  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        self._script_name = account._script_name  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        self._script_key = account._script_key  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        self._site_url = account.site_url.rstrip('/')
+        self._script_name = account.script_name
+        self._script_key = account.script_key
         self._claims = claims
         self._directory = directory
         self._minter = minter
@@ -256,7 +248,7 @@ class UserTokenService:
             token_type=_audit_token_type(request.token_type),
         )
 
-    def _mint_rest(self, login: str) -> tuple[IssuedUserToken, str]:
+    def _mint_rest(self, login: str) -> tuple[_IssuedUserToken, str]:
         """Mint or serve the cached REST token for `login`."""
 
         def mint() -> _CachedMint:
@@ -275,7 +267,7 @@ class UserTokenService:
         (minted, expires_at), cache_hit = self._cache.get_or_create(
             (login, _REST_TYPE), _TOKEN_CACHE_TTL_SECONDS, mint
         )
-        issued = IssuedUserToken(
+        issued = _IssuedUserToken(
             token=minted.token,
             token_type=_REST_TYPE,
             login=login,
@@ -285,7 +277,7 @@ class UserTokenService:
         )
         return issued, 'hit' if cache_hit else 'miss'
 
-    def _mint_session(self, login: str, *, refresh: bool) -> tuple[IssuedUserToken, str]:
+    def _mint_session(self, login: str, *, refresh: bool) -> tuple[_IssuedUserToken, str]:
         """Mint, serve, or SG-verify-and-replace the session token for `login`."""
 
         def mint() -> _CachedMint:
@@ -313,7 +305,7 @@ class UserTokenService:
                 (login, _SESSION_TYPE), self._session_ttl, mint
             )
             outcome = 'hit' if cache_hit else 'miss'
-        issued = IssuedUserToken(
+        issued = _IssuedUserToken(
             token=minted.token,
             token_type=_SESSION_TYPE,
             login=login,
@@ -332,7 +324,7 @@ class UserTokenService:
         except UserLookupError as exc:
             raise _UpstreamError('SG upstream request failed') from exc
 
-    def issue_token(self, request: UserTokenRequest) -> IssuedUserToken:
+    def issue_token(self, request: UserTokenRequest) -> _IssuedUserToken:
         """Issue a user-bound token for a verified caller.
 
         Args:
@@ -347,6 +339,8 @@ class UserTokenService:
         Raises:
             UserTokenError: One of the typed subclasses, mapping to an HTTP
                 status. Messages stay generic; specifics go to the audit log.
+            Exception: If the identity provider cannot be queried; the claims
+                policy's operational exception propagates unchanged.
         """
         try:
             claims = self._claims.validate(request.authorization)
@@ -395,7 +389,7 @@ class UserTokenService:
 
         Args:
             reason: Fixed denial reason from the HTTP layer's closed set.
-            source_ip: TCP source address for the request.
+            source_ip: Audited source address for the request.
             request_id: Correlation id generated by the HTTP layer.
         """
         self._audit.log('deny', reason=reason, source_ip=source_ip, request_id=request_id)

@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
+from unittest.mock import Mock
 
 import jwt
 import pytest
@@ -15,11 +16,10 @@ from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1, generate_pri
 
 from sg_token_broker import _oidcverify as oidcverify
 from sg_token_broker._oidcverify import OidcUnavailableError, oidc_verifier
-from tests._tls import _write_tls_material
+from tests._tls import write_tls_material
 
 _KEY = generate_private_key(SECP256R1())
 _KID = 'test-key-1'
-_SYMMETRIC_KEY = b'test-only-hmac-key-with-at-least-32-bytes'
 
 
 class _Provider:
@@ -57,16 +57,16 @@ class _Provider:
             def log_message(self, *args: object, **kwargs: object) -> None:
                 del args, kwargs
 
-        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-        self.url = f'http://127.0.0.1:{self.server.server_address[1]}'
+        self._server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.url = f'http://127.0.0.1:{self._server.server_address[1]}'
         self.issuer = self.url
         threading.Thread(
-            target=self.server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True
+            target=self._server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True
         ).start()
 
     def close(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
+        self._server.shutdown()
+        self._server.server_close()
 
 
 class _RedirectProvider:
@@ -124,31 +124,33 @@ class _RedirectProvider:
 
         self.downgrade_hits = 0
         self.redirect_discovery = False
-        self.downgrade_server = ThreadingHTTPServer(('127.0.0.1', 0), DowngradeHandler)
-        downgrade_port = self.downgrade_server.server_address[1]
+        self._downgrade_server = ThreadingHTTPServer(('127.0.0.1', 0), DowngradeHandler)
+        downgrade_port = self._downgrade_server.server_address[1]
         self.downgrade_url = f'http://0.0.0.0:{downgrade_port}'
-        self.server = ThreadingHTTPServer(('127.0.0.1', 0), SecureHandler)
-        certificate_path, key_path = _write_tls_material(directory)
+        self._server = ThreadingHTTPServer(('127.0.0.1', 0), SecureHandler)
+        certificate_path, key_path = write_tls_material(directory)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certificate_path, key_path)
-        self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
-        self.issuer = f'https://127.0.0.1:{self.server.server_address[1]}'
+        self._server.socket = context.wrap_socket(self._server.socket, server_side=True)
+        self.issuer = f'https://127.0.0.1:{self._server.server_address[1]}'
         self.certificate_path = certificate_path
         self.session = requests.Session()
         self.session.trust_env = False
         self.session.verify = str(certificate_path)
         threading.Thread(
-            target=self.downgrade_server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True
+            target=self._downgrade_server.serve_forever,
+            kwargs={'poll_interval': 0.01},
+            daemon=True,
         ).start()
         threading.Thread(
-            target=self.server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True
+            target=self._server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True
         ).start()
 
     def close(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.downgrade_server.shutdown()
-        self.downgrade_server.server_close()
+        self._server.shutdown()
+        self._server.server_close()
+        self._downgrade_server.shutdown()
+        self._downgrade_server.server_close()
 
 
 class TestOidcVerifier:
@@ -240,14 +242,10 @@ class TestOidcVerifier:
         with pytest.raises(ValueError, match=r'[Ii]ssuer'):
             verify(_sign(_claims(provider, iss=provider.issuer[:-1])))
 
-    def test_rejects_symmetric_algorithm_configuration(self, provider: _Provider) -> None:
-        provider.jwk = _symmetric_jwk()
-
-        def verify_symmetric_token() -> object:
-            return oidc_verifier(provider.issuer, ('HS256',))(_sign_symmetric(_claims(provider)))
-
+    @pytest.mark.usefixtures('no_requests')
+    def test_rejects_symmetric_algorithm_configuration(self) -> None:
         with pytest.raises(ValueError, match='asymmetric'):
-            verify_symmetric_token()
+            oidc_verifier('https://idp.example', ('HS256',))
 
     def test_rejects_token_without_exp(self, provider: _Provider) -> None:
         verify = oidc_verifier(provider.issuer, ('ES256',))
@@ -280,11 +278,11 @@ class _StubResponse:
 
 class _StubSession:
     def __init__(self, response: _StubResponse) -> None:
-        self.response = response
+        self._response = response
 
     def get(self, url: str, *, timeout: float, allow_redirects: bool) -> _StubResponse:
         del url, timeout, allow_redirects
-        return self.response
+        return self._response
 
 
 def _jwk(*, kid: str = _KID) -> dict[str, object]:
@@ -298,8 +296,8 @@ def _resolver(
 ) -> oidcverify._SigningKeyResolver:
     client = jwt.PyJWKClient('https://idp.example/jwks', cache_keys=True)
     return oidcverify._SigningKeyResolver(
-        cast('oidcverify._JwkClient', client),
-        cast('oidcverify._JwtModule', jwt),
+        client,
+        jwt,
         fetch_jwks,
         clock=lambda: now[0],
     )
@@ -307,16 +305,6 @@ def _resolver(
 
 def _sign(claims: dict[str, object], *, algorithm: str = 'ES256', kid: str = _KID) -> str:
     return jwt.encode(claims, _KEY, algorithm=algorithm, headers={'kid': kid})
-
-
-def _sign_symmetric(claims: dict[str, object]) -> str:
-    return jwt.encode(claims, _SYMMETRIC_KEY, algorithm='HS256', headers={'kid': _KID})
-
-
-def _symmetric_jwk() -> dict[str, object]:
-    algorithm = jwt.get_algorithm_by_name('HS256')
-    jwk = json.loads(algorithm.to_jwk(_SYMMETRIC_KEY))
-    return jwk | {'kid': _KID, 'use': 'sig', 'alg': 'HS256'}
 
 
 @pytest.fixture
@@ -422,6 +410,29 @@ def test_failed_attempt_is_replayed_without_io_until_recovery_boundary() -> None
 
     assert signing_key.key_id == 'recovered-key'
     assert fetches == [0.0, 5.0]
+
+
+@pytest.mark.parametrize(
+    ('site', 'message'),
+    [('discovery', 'discovery could not be sent: '), ('JWKS', 'JWKS could not be sent: ')],
+)
+def test_missing_ca_bundle_is_a_setup_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str, message: str
+) -> None:
+    missing = tmp_path / 'missing-ca.pem'
+    monkeypatch.setenv('REQUESTS_CA_BUNDLE', str(missing))
+    monkeypatch.setattr(
+        'urllib3.connection.HTTPSConnection.connect',
+        Mock(side_effect=AssertionError('unexpected connection')),
+    )
+    with pytest.raises(requests.RequestException) as caught:
+        oidcverify._fetch_json_without_redirects(
+            requests.Session(), 'https://127.0.0.1:1', 1.0, site
+        )
+    assert isinstance(caught.value.__cause__, OSError)
+    assert not isinstance(caught.value.__cause__, requests.RequestException)
+    assert str(caught.value) == message + str(caught.value.__cause__)
+    assert str(missing) in str(caught.value)
 
 
 def test_overlapping_unknown_kids_fetch_once_without_concurrent_io() -> None:

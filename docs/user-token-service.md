@@ -15,14 +15,10 @@ identity-provider ID token for an SG token. To decide whether you need user toke
 | Diagnose a failed request or read the audit log   | [Operations and troubleshooting](#operations-and-troubleshooting)                                |
 | Look up a setting, response field, or status code | [Configuration reference](#configuration-reference) or [HTTP API reference](#http-api-reference) |
 
-For each request, the service verifies the caller's ID token, finds the one SG user whose email
-matches the verified address, and asks SG for a token bound to that user's login. It does this with
-its own *sudo-capable* script account: an SG script account whose permissions allow it to act as
-other users (SG's `sudo_as_login`).
-
-The resulting token has the person's full SG permissions, including writes when their role allows
-them. The service has no read-only token scope, so restrict access through the person's SG
-permission role. See [permissions and attribution](design.md#permissions-and-attribution).
+The service maps the verified email to exactly one SG user and issues a token with that person's
+full permissions, including any writes their role allows. It has no read-only token scope.
+Configure the person's SG role accordingly; see
+[permissions and attribution](design.md#permissions-and-attribution).
 
 ## Cloud Run REST deployment
 
@@ -37,8 +33,8 @@ You need:
 - A Google Cloud project with Cloud Run and Secret Manager available, and a configured `gcloud`
   CLI.
 - Access to deploy from this checkout.
-- A dedicated sudo-capable SG script account for the service, created by an SG administrator. The
-  commands below call it `user_token_service`.
+- A dedicated sudo-capable SG script account, created by an SG administrator: SG must allow it to
+  act as other users through `sudo_as_login`. The commands below call it `user_token_service`.
 - A Workspace group whose members may call the service. Granting access to a group keeps the
   service from being exposed anonymously.
 
@@ -59,6 +55,18 @@ Set these shell variables to your deployment values before using the commands:
 | `INVOKER_GROUP`    | Workspace group email for authorized callers                   |
 | `RUNTIME_SA`       | Runtime service-account email                                  |
 
+Give the project's default compute service account the Cloud Run Builder role, once per project.
+The deploy commands below build images from source as that account; without the role, the first
+deploy fails with `does not have storage.objects.get access`:
+
+```sh
+PROJECT_ID="$(gcloud config get-value project)"
+PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member "serviceAccount:$PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+    --role roles/run.builder
+```
+
 ### Find the Apps Script audience
 
 Cloud Run and the service both check the ID token's audience, which for an Apps Script caller is
@@ -69,8 +77,11 @@ audience, not the token:
 ```javascript
 function logIdentityAudience() {
   const token = ScriptApp.getIdentityToken();
+  // JWT segments omit base64 padding; restore it before decoding.
+  const segment = token.split('.')[1];
+  const padded = segment + '='.repeat((4 - (segment.length % 4)) % 4);
   const payload = Utilities.newBlob(
-    Utilities.base64DecodeWebSafe(token.split('.')[1])
+    Utilities.base64DecodeWebSafe(padded)
   ).getDataAsString();
   Logger.log(JSON.parse(payload).aud);
 }
@@ -81,10 +92,11 @@ Set `SCRIPT_CLIENT_ID` to the logged value.
 ### Cloud Run authentication check
 
 Before deploying the token service, confirm that Cloud Run accepts the script's identity tokens and
-rejects callers outside the invoker group. This repository includes a small check service that
-echoes the caller's identity claims and needs no SG key, so a misconfiguration exposes nothing. Use
-the same region, audience, and invoker group that you plan for the token service. From the
-repository root:
+rejects callers outside the invoker group. The check service needs no SG key, but it echoes the
+caller's identity claims and relies on Cloud Run to verify the token. Keep it behind IAM with
+`--no-allow-unauthenticated`; it does not verify signatures itself.
+
+Use the token service's intended region, audience, and invoker group. From the repository root:
 
 ```sh
 gcloud run deploy sg-token-auth-check \
@@ -119,6 +131,9 @@ Verify both outcomes before you continue:
    request, which shows that Cloud Run stopped it. A 401 means Cloud Run rejected the token itself,
    so it does not show that group membership is enforced.
 
+New invoker bindings and group membership changes take a few minutes to apply. If a group member
+gets HTTP 403 right after setup, wait a few minutes and run the check again.
+
 Use an Apps Script token for both checks. A token from `gcloud auth print-identity-token` has a
 different audience and does not test this caller path. If either check fails, fix the identity or
 IAM configuration before deploying the token service. When both pass, delete the check service:
@@ -143,6 +158,19 @@ gcloud secrets add-iam-policy-binding sg-user-token-key \
     --role roles/secretmanager.secretAccessor
 ```
 
+Write the service settings to a file outside the repository, so that the deploy does not upload it
+with the source:
+
+```sh
+cat >~/sg-user-tokens.env.yaml <<EOF
+SGUT_SITE_URL: "$SG_SITE_URL"
+SGUT_SCRIPT_NAME: "user_token_service"
+SGUT_AUDIENCES: "$SCRIPT_CLIENT_ID"
+SGUT_TOKEN_TYPES: "rest"
+SGUT_ALLOWED_DOMAIN: "$WORKSPACE_DOMAIN"
+EOF
+```
+
 From the repository root, deploy the Dockerfile with the same audience that the caller uses:
 
 ```sh
@@ -151,14 +179,15 @@ gcloud run deploy sg-user-tokens \
     --region "$REGION" \
     --service-account "$RUNTIME_SA" \
     --no-allow-unauthenticated \
+    --concurrency 32 \
     --add-custom-audiences "$SCRIPT_CLIENT_ID" \
     --set-secrets "SGUT_SCRIPT_KEY=sg-user-token-key:latest" \
-    --set-env-vars "SGUT_SITE_URL=$SG_SITE_URL" \
-    --set-env-vars "SGUT_SCRIPT_NAME=user_token_service" \
-    --set-env-vars "SGUT_AUDIENCES=$SCRIPT_CLIENT_ID" \
-    --set-env-vars "SGUT_TOKEN_TYPES=rest" \
-    --set-env-vars "SGUT_ALLOWED_DOMAIN=$WORKSPACE_DOMAIN"
+    --env-vars-file ~/sg-user-tokens.env.yaml
 ```
+
+The service handles at most 32 requests at a time and closes any further connection without a
+response. `--concurrency 32` makes Cloud Run start another instance instead of sending an instance
+more requests than it can answer.
 
 Authorize the caller group:
 
@@ -174,9 +203,26 @@ an authorized user whose email matches an active SG account. Consumer Google acc
 with HTTP 401 because they carry no Workspace `hd` claim; that claim must match
 `SGUT_ALLOWED_DOMAIN`.
 
-To accept another Apps Script project or app later, add its audience to both
-`--add-custom-audiences` and `SGUT_AUDIENCES`. Cloud Run accepts only tokens issued for its own URL
-or a listed custom audience, and the service checks the audience again itself.
+If you also need an SG-side IP allowlist for the service's script account, a static Cloud NAT
+egress address can provide a fixed source address.
+
+### Add another caller
+
+To accept another Apps Script project or app later, Cloud Run and the service both need its client
+ID: Cloud Run accepts only tokens issued for its own URL or a listed custom audience, and the
+service checks the audience again itself. Add the new ID to `SGUT_AUDIENCES` in
+`~/sg-user-tokens.env.yaml`, separated by a comma, for example
+`SGUT_AUDIENCES: "first-client-id,second-client-id"`. Then update the service:
+
+```sh
+gcloud run services update sg-user-tokens \
+    --region "$REGION" \
+    --add-custom-audiences "$NEW_CLIENT_ID" \
+    --env-vars-file ~/sg-user-tokens.env.yaml
+```
+
+The settings file replaces all of the service's plain environment variables, so keep every setting
+in it. The script key stays in place because it comes from Secret Manager.
 
 ## Private deployment for session tokens
 
@@ -191,9 +237,9 @@ Kubernetes ingress or reverse proxy terminating TLS. Configure the deployment as
 - **Token types:** set `SGUT_TOKEN_TYPES=session`. The service issues only the token types listed,
   so a REST deployment cannot mint sessions, and a session deployment need not mint REST tokens.
 - **Network access:** limit access to trusted networks through private ingress or VPN-only routing.
-  The service listens on all interfaces at `PORT`, so a host firewall must reject direct
-  connections to `PORT` from anything except the TLS proxy. For a proxy on the same host, allow
-  connections from loopback only.
+  By default the service listens on all interfaces at `PORT`; set `SGUT_BIND=127.0.0.1` when the
+  TLS proxy is on the same host, and keep a host firewall that rejects direct connections to `PORT`
+  from anything except the proxy.
 - **Script account:** give this deployment its own minimal sudo-capable script account, separate
   from any Cloud Run deployment's, so that you can retire one deployment's account after a
   compromise without breaking the other.
@@ -226,13 +272,14 @@ export SGUT_ALLOWED_DOMAIN='studio.example'
 export SGUT_TOKEN_TYPES='session'
 export SGUT_PROVIDER='google'
 export SGUT_TRUSTED_PROXIES='127.0.0.1'
+export SGUT_BIND='127.0.0.1'
 export PORT='8080'
 sg-token-broker serve-user-tokens
 ```
 
-Replace the example proxy address with the proxy's actual peer addresses. In this same-host layout,
-the host firewall must allow the TLS proxy to reach port 8080 over loopback and reject connections
-to that port from other interfaces. Configure connection limits and timeouts at the proxy.
+Replace the example proxy address with the proxy's actual peer addresses. In this same-host layout
+the service accepts connections only over loopback; keep the host firewall rule as defense in
+depth. Configure connection limits and timeouts at the proxy.
 
 On startup, the service prints `serving user tokens on port 8080`. A successful `GET /healthz`
 checks only the listener, so verify a sign-in and an SG token request before giving clients access.
@@ -241,15 +288,22 @@ before deciding how clients handle rejected tokens and how you offboard people.
 
 ## Desktop client setup
 
-Ask the service administrator for the service's HTTPS URL, the token type it issues, the
-installed-app OAuth client ID, and, for a provider other than Google, the provider's issuer URL. A
-session request needs a private session-token service; the REST-only Cloud Run service rejects it.
+### Connect and sign in
+
+Ask the service administrator for the service's HTTPS URL, the token type it issues, and the
+installed-app OAuth client ID. For Google, also ask for the client's secret; for another provider,
+ask for its issuer URL. A session request needs a private session-token service; the REST-only
+Cloud Run service rejects it.
 
 Administrators register that OAuth client as an installed (native) app that allows loopback
 redirects to `http://127.0.0.1:<port>/callback`; the CLI listens on a new free port for each
-sign-in. The service's `SGUT_AUDIENCES` must include the client ID, because the ID token's audience
-is the client that requested it. For stored sign-in through an OIDC provider, the client must also
-be allowed the `offline_access` scope.
+sign-in. In Google Cloud, that is a client of type **Desktop app**. Google requires its client
+secret for every sign-in, and treats it as part of the app rather than as a confidential value, so
+give it to users with the client ID. The service's `SGUT_AUDIENCES` must include the client ID,
+because the ID token's audience is the client that requested it. For stored sign-in through an OIDC
+provider other than Google, the client must also be allowed the `offline_access` scope. Without it,
+each process opens the browser once and reuses that sign-in until a minute before its ID token
+expires.
 
 From a checkout, install the CLI with persistent sign-in support and point it at the service:
 
@@ -257,9 +311,11 @@ From a checkout, install the CLI with persistent sign-in support and point it at
 uv tool install '.[login]'
 export SG_USER_TOKEN_URL='https://user-token-service.example.invalid'
 export SG_USER_TOKEN_CLIENT_ID='installed-app-client-id'
+export SG_USER_TOKEN_CLIENT_SECRET='installed-app-client-secret'
 ```
 
-Google is the default provider. For another OIDC provider, also set its exact issuer URL:
+Google is the default provider. Leave `SG_USER_TOKEN_CLIENT_SECRET` unset when your provider issued
+no secret. For another OIDC provider, also set its exact issuer URL:
 
 ```sh
 export SG_USER_TOKEN_ISSUER='https://identity.example.invalid'
@@ -277,11 +333,27 @@ sg-token-broker get-user-token --token-type session
 It requests a session token unless you pass `--token-type rest`, and opens the browser itself when
 no stored sign-in is available.
 
+Python applications use `UserTokenClient`, which reads the same environment variables; see
+[user tokens](modes.md#user-tokens) for an example, and install the package in the application's
+own Python environment. The client checks the current sign-in on every `fetch_token` call and
+reuses a cached SG token only while the ID token's `sub` claim matches the identity that obtained
+it, so switching accounts takes effect on the next call. It requests a new REST token 60 seconds
+before `expires_at`, and keeps a session until you pass `force_refresh=True`.
+
+### Manage stored accounts
+
 With the `login` extra, `login` stores a refresh credential in the operating system's keyring, so
-later commands and processes do not open the browser. Only the macOS Keychain, the Linux Secret
-Service, and the Windows Credential Manager are used. With any other keyring, or without the extra,
-`login` reports `(credential not stored)`, and later commands open the browser again.
-`login --no-store` signs in without storing a credential, for shared or ephemeral machines.
+later commands and processes do not open the browser. The supported stores are:
+
+| Platform | Credential store   |
+| -------- | ------------------ |
+| macOS    | Keychain           |
+| Linux    | Secret Service     |
+| Windows  | Credential Manager |
+
+With any other keyring, or without the extra, `login` reports `(credential not stored)`, and later
+commands open the browser again. `login --no-store` signs in without storing a credential, for
+shared or ephemeral machines.
 
 Each stored credential is named after the account that `login` printed: the value of the ID-token
 claim named by `SG_USER_TOKEN_EMAIL_CLAIM` (default `email`), else `sub`, else `unknown`. Commands
@@ -289,13 +361,6 @@ use the most recently signed-in account unless `SG_USER_TOKEN_ACCOUNT` names ano
 account. This name only selects a local credential; the service separately requires a verified
 email that meets its provider and domain policy. `sg-token-broker logout` removes the selected
 account's stored credential. It does not revoke SG tokens already issued.
-
-Python applications use `UserTokenClient`, which reads the same environment variables; see
-[user tokens](modes.md#user-tokens) for an example, and install the package in the application's
-own Python environment. The client checks the current sign-in on every `fetch_token` call and
-reuses a cached SG token only while the ID token's `sub` claim matches the identity that obtained
-it, so switching accounts takes effect on the next call. It requests a new REST token 60 seconds
-before `expires_at`, and keeps a session until you pass `force_refresh=True`.
 
 ## Apps Script caller
 
@@ -344,39 +409,38 @@ function fetchSgToken() {
 }
 ```
 
-Restrict edit access to the Sheet's container-bound script. Anyone who can edit it could change it
-to collect tokens from people who open the Sheet.
+Share edit access to the Sheet only with people you trust. Anyone who can edit the Sheet can also
+edit its script, and could change it to collect tokens from the people who run it.
 
 ## Operations and troubleshooting
 
-- **Suspend a person's SG access:** disable their SG account, and remove their access to the
-  service to stop future issuance. Restoring an account can revive REST tokens that have not yet
-  expired, and old session behavior after restoration is not established; see
-  [human-account tokens](sg-token-behavior.md#human-account-tokens).
-- **Rotate or replace the service key:** update the secret-store version, then restart the service
-  or deploy a new Cloud Run revision; the service reads `SGUT_SCRIPT_KEY` only at startup. Key
-  rotation does not revoke existing sessions. Give each deployment its own script account, and
-  after a compromise follow
-  [Retire a compromised script account](deployment.md#retire-a-compromised-script-account).
-- **Every caller receives 502:** check the service script key and its Secret Manager version first.
-  An invalid key is logged as an `error` event with reason `upstream_error`. For REST requests, an
-  SG REST token lifetime of 150 seconds or less also causes 502, with the `detail`
-  `SG token lifetime too short to serve`: the service reuses each REST token for up to 120 seconds
-  and keeps a 30-second margin before its expiry.
-- **A caller receives 401:** Cloud Run or the service rejected the ID token. When the service
-  rejected it, the audit record's `detail` names the failed check, such as `audience not accepted`,
-  `email domain not allowed`, or `email is not verified`.
-- **A caller receives 403:** check that the person has an active SG account with a matching email,
-  that the deployment issues the requested token type, and, on Cloud Run, that the person is in the
-  invoker group. A service `deny` event with reason `forbidden` means the deployment does not issue
-  that token type, no single SG user matches the email, or SG refused to issue a token for that
-  user, for example because the account is disabled. A 403 with no service event came from Cloud
-  Run IAM.
-- **A caller receives 500:** if the identity provider fails while the service verifies a token, the
-  service returns an opaque 500 rather than 401, so that a provider outage is not reported as a
-  rejected identity. Inspect the server logs for the cause.
-- **Additional egress restriction:** a static Cloud NAT address can support an SG-side IP allowlist
-  for the service's script account.
+### Suspend access
+
+Disable the person's SG account, and remove their access to the service to stop future issuance.
+Restoring an account can revive unexpired REST tokens; do not rely on disabling and restoring it to
+retire old sessions. See [human-account tokens](sg-token-behavior.md#human-account-tokens).
+
+### Rotate the service key
+
+Update the secret-store version, then restart the service or deploy a new Cloud Run revision.
+`SGUT_SCRIPT_KEY` is read only at startup. Rotation does not revoke existing sessions. Give each
+deployment its own script account; after a compromise, follow
+[Retire a compromised script account](deployment.md#retire-a-compromised-script-account).
+
+### Diagnose failed requests
+
+Use the status and service audit record together to find the cause:
+
+| Symptom              | What to check                                                                                                                                                                                                                                                                                                                                                          |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 401                  | The ID token was rejected. A service audit `detail` identifies the failed check, such as `audience not accepted`, `email domain not allowed`, or `email is not verified`. Cloud Run can also reject the token before it reaches the service.                                                                                                                           |
+| 403                  | Check the requested token type, a unique matching active SG account, and Cloud Run invoker-group membership. A service `deny` with reason `forbidden` means the token type is disabled, no single user matches, or SG refused issuance for that user. A 403 with no service event came from Cloud Run IAM; new bindings and group changes take a few minutes to apply. |
+| 500                  | Check server logs for an identity-provider failure or unexpected error. Provider failures return an opaque 500 so an outage is not reported as a rejected identity.                                                                                                                                                                                                    |
+| 502 for every caller | Check the service script key and Secret Manager version first. An invalid key produces an `error` event with reason `upstream_error`. Also check SG's REST token lifetime, as described below.                                                                                                                                                                         |
+
+For REST requests, an SG lifetime of 150 seconds or less causes 502 with audit detail
+`SG token lifetime too short to serve`. The service reuses REST tokens for up to 120 seconds and
+keeps a 30-second margin before expiry.
 
 ### Audit logs
 
@@ -398,6 +462,8 @@ which lets you match a found token to its issuance without logging the token its
 - `reason` comes from a fixed set: `unauthorized`, `forbidden`, `bad_request`, `not_found`,
   `method_not_allowed`, `upstream_error`, or `internal_error`.
 - An unrecognized `token_type` is recorded as `invalid`.
+- On Cloud Run, `source_ip` is the address of Google's front end, not the caller's. Cloud Run's
+  request log records each caller's address as `httpRequest.remoteIp`.
 
 The startup line `serving user tokens on port ...` goes to standard error and can appear at ERROR
 severity in Cloud Logging even after a successful start. Stack traces for unexpected errors are
@@ -423,6 +489,7 @@ The service reads its configuration from environment variables at startup.
 | `SGUT_OIDC_ALGORITHMS`       | `ES256,RS256`       | OIDC only: comma-separated asymmetric signature algorithms to accept.                                        |
 | `SGUT_SESSION_TTL_SECONDS`   | `600`               | Positive integer: how long the service reuses a cached session token.                                        |
 | `SGUT_TRUSTED_PROXIES`       | Empty               | Comma-separated proxy IP addresses whose `X-Forwarded-For` header the service trusts.                        |
+| `SGUT_BIND`                  | All interfaces      | IP address to listen on. Set `127.0.0.1` when the TLS proxy runs on the same host.                           |
 | `PORT`                       | `8080`              | Listening port. Cloud Run sets it.                                                                           |
 
 `SGUT_OIDC_ALGORITHMS` accepts `ES256`, `ES384`, `ES512`, `EdDSA`, `PS256`, `PS384`, `PS512`,

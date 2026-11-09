@@ -1,9 +1,12 @@
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import requests
+from google.auth import exceptions
 
 from sg_token_broker import _googleverify
 from sg_token_broker._googleverify import VerifierUnavailableError, google_auth_verifier
@@ -176,3 +179,22 @@ def _install_stub_modules(monkeypatch: pytest.MonkeyPatch, stubs: _StubModules) 
         'import_module',
         import_module,
     )
+
+
+def test_missing_ca_bundle_is_a_setup_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / 'missing-ca.pem'
+    monkeypatch.setenv('REQUESTS_CA_BUNDLE', str(missing))
+    monkeypatch.setattr(
+        'urllib3.connection.HTTPSConnection.connect',
+        Mock(side_effect=AssertionError('unexpected connection')),
+    )
+    with pytest.raises(exceptions.TransportError) as caught:
+        google_auth_verifier()('unused-token')
+    assert isinstance(caught.value.__cause__, OSError)
+    assert not isinstance(caught.value.__cause__, requests.RequestException)
+    assert str(caught.value) == 'Google certificate request could not be sent: ' + str(
+        caught.value.__cause__
+    )
+    assert str(missing) in str(caught.value)

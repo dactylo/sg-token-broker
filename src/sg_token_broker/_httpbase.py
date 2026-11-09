@@ -1,5 +1,6 @@
 """Share HTTP framing, JSON responses, routing helpers, and bounded concurrency."""
 
+import ipaddress
 import json
 import logging
 import socket
@@ -19,15 +20,47 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
     Worker threads are daemons. Connections accepted at capacity are closed
     without a response. When using inherited `handle_error`, configure
-    `error_logger` before serving requests.
+    `_error_logger` before serving requests.
 
     Attributes:
-        error_logger: Logger receiving unexpected request-handler failures.
+        _error_logger: Logger receiving unexpected request-handler failures.
     """
 
     daemon_threads = True
-    error_logger: logging.Logger
+    _error_logger: logging.Logger
     _worker_slots: threading.BoundedSemaphore
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        request_handler_class: type[BaseHTTPRequestHandler],
+        bind_and_activate: bool = True,
+    ) -> None:
+        """Create a server socket using the bind address's IP family.
+
+        A literal IPv6 address selects IPv6; other addresses select IPv4.
+
+        Args:
+            server_address: Bind host and port. Port zero requests an
+                operating-system-assigned port.
+            request_handler_class: Handler class instantiated for accepted
+                connections.
+            bind_and_activate: Whether to bind and activate immediately.
+                When false, call `server_bind()` and `server_activate()` before
+                serving.
+
+        Raises:
+            OSError: If socket creation, binding, or activation fails.
+        """
+        try:
+            host = ipaddress.ip_address(server_address[0])
+        except ValueError:
+            self.address_family = socket.AF_INET
+        else:
+            self.address_family = (
+                socket.AF_INET6 if isinstance(host, ipaddress.IPv6Address) else socket.AF_INET
+            )
+        super().__init__(server_address, request_handler_class, bind_and_activate)
 
     def handle_error(
         self, request: socket.socket | tuple[bytes, socket.socket], client_address: object
@@ -39,7 +72,7 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             client_address: The client address associated with the request.
         """
         del request
-        self.error_logger.log(
+        self._error_logger.log(
             logging.ERROR,
             'unhandled error serving request from %s',
             client_address,
@@ -58,6 +91,11 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
         Args:
             request: Accepted client connection.
             client_address: Address associated with the client connection.
+
+        Raises:
+            RuntimeError: If a worker thread cannot be started; its reserved
+                slot is released.
+            OSError: If closing a rejected connection fails.
         """
         if not self._worker_slots.acquire(blocking=False):
             self.shutdown_request(request)
@@ -83,7 +121,11 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             self._worker_slots.release()
 
     def server_activate(self) -> None:
-        """Create the worker-slot semaphore, then activate the socket."""
+        """Create the worker-slot semaphore, then activate the socket.
+
+        Raises:
+            OSError: If the socket cannot begin listening.
+        """
         self._worker_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_REQUESTS)
         super().server_activate()
 
@@ -93,24 +135,20 @@ class JsonErrorHandler(BaseHTTPRequestHandler):
 
     `BaseHTTPRequestHandler` calls `send_error(501, ...)` when a request's
     method has no `do_*` handler. This override maps that one case to 405 and
-    reports it through `log_denial`; every other stdlib error is unchanged.
+    reports it through `_log_denial`; every other stdlib error is unchanged.
 
-    When using inherited `log_request`, configure `access_logger` before
-    handling requests. Subclasses may override `log_denial` to record
+    When using inherited `log_request`, configure `_access_logger` before
+    handling requests. Subclasses may override `_log_denial` to record
     unsupported-method denials.
 
     Attributes:
-        access_logger: Logger receiving per-request access records at DEBUG.
+        _access_logger: Logger receiving per-request access records at DEBUG.
     """
 
-    access_logger: logging.Logger
+    _access_logger: logging.Logger
 
-    def log_denial(self, reason: str) -> None:
-        """Record an unsupported-method denial; no-op by default.
-
-        Args:
-            reason: Fixed denial reason (`method_not_allowed`).
-        """
+    def _log_denial(self, reason: str) -> None:
+        """Record an unsupported-method denial; no-op by default."""
         del reason
 
     def log_request(self, code: int | str = '-', size: int | str = '-') -> None:
@@ -120,7 +158,7 @@ class JsonErrorHandler(BaseHTTPRequestHandler):
             code: HTTP response status code.
             size: Response size in bytes.
         """
-        self.access_logger.debug('%s %s %s', self.requestline, code, size)
+        self._access_logger.debug('%s %s %s', self.requestline, code, size)
 
     def send_error(
         self, code: int, message: str | None = None, explain: str | None = None
@@ -131,11 +169,14 @@ class JsonErrorHandler(BaseHTTPRequestHandler):
             code: HTTP status the stdlib chose.
             message: Error summary passed through for non-501 errors.
             explain: Error explanation passed through for non-501 errors.
+
+        Raises:
+            OSError: If the HTTP response cannot be written.
         """
         if code != HTTPStatus.NOT_IMPLEMENTED:
             super().send_error(code, message, explain)
             return
-        self.log_denial('method_not_allowed')
+        self._log_denial('method_not_allowed')
         respond(self, 405, {'error': 'method_not_allowed', 'detail': 'method not allowed'})
 
 
@@ -179,6 +220,9 @@ def respond(handler: BaseHTTPRequestHandler, status: int, body: Mapping[str, obj
         status: HTTP status code.
         body: JSON-serializable response body. Its bytes are omitted for a HEAD
             request (the headers, including Content-Length, are sent).
+
+    Raises:
+        OSError: If the response headers or body cannot be written.
     """
     payload = json.dumps(dict(body)).encode()
     handler.send_response(status)

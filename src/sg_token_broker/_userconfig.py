@@ -22,29 +22,11 @@ class UserConfigError(Exception):
 
 
 @dataclass(frozen=True)
-class UserTokenConfig:
-    """Validated user-token service configuration.
+class _UserTokenConfig:
+    """Contain validated user-token service configuration."""
 
-    Do not serialize with `dataclasses.asdict` or `astuple`; they bypass
-    `repr=False` and would leak `script_key`.
-
-    Attributes:
-        site_url: Base URL of the SG site without a trailing slash.
-        script_name: Service ApiUser script name.
-        script_key: Service ApiUser application key.
-        audiences: Accepted identity-token audience values.
-        allowed_domain: Required domain for caller email addresses.
-        port: HTTP listening port.
-        token_types: Token types the deployment may issue.
-        session_ttl_seconds: Maximum service-cache lifetime for sessions.
-        trusted_proxies: Peer addresses allowed to supply `X-Forwarded-For`.
-        provider: Identity provider type, `google` or `oidc`.
-        issuer: Configured OIDC issuer, or `None` for Google.
-        email_claim: Identity-token claim containing the caller email.
-        assume_email_verified: Whether the provider contract allows a missing
-            `email_verified` claim.
-        oidc_algorithms: Accepted asymmetric OIDC signature algorithms.
-    """
+    # Do not serialize with dataclasses.asdict or astuple: they bypass
+    # repr=False and would leak script_key.
 
     site_url: str
     script_name: str
@@ -60,6 +42,7 @@ class UserTokenConfig:
     email_claim: str
     assume_email_verified: bool
     oidc_algorithms: tuple[str, ...]
+    bind: str = ''
 
 
 def _nonempty(value: str, name: str) -> str:
@@ -67,6 +50,17 @@ def _nonempty(value: str, name: str) -> str:
     if not value:
         raise UserConfigError(f'{name} is empty after normalization')
     return value
+
+
+def _parse_bind(environ: Mapping[str, str]) -> str:
+    """Return the optional IP listen address, or `''` for all interfaces."""
+    raw = environ.get(f'{_ENV_PREFIX}_BIND', '').strip()
+    if raw:
+        try:
+            ipaddress.ip_address(raw)
+        except ValueError as exc:
+            raise UserConfigError(f'SGUT_BIND must be an IP address; got {raw!r}') from exc
+    return raw
 
 
 def _require(environ: Mapping[str, str], name: str) -> str:
@@ -133,7 +127,7 @@ def _parse_trusted_proxies(
     return frozenset(trusted_proxies)
 
 
-def load_user_token_config(environ: Mapping[str, str]) -> UserTokenConfig:
+def load_user_token_config(environ: Mapping[str, str]) -> _UserTokenConfig:
     """Load and validate the service configuration from environment variables.
 
     Args:
@@ -198,7 +192,7 @@ def load_user_token_config(environ: Mapping[str, str]) -> UserTokenConfig:
             f'{_ENV_PREFIX}_OIDC_ALGORITHMS must name asymmetric JWS algorithms from '
             f'{sorted(ASYMMETRIC_OIDC_ALGORITHMS)}; got {sorted(symmetric)}'
         )
-    return UserTokenConfig(
+    return _UserTokenConfig(
         site_url=site_url.rstrip('/'),
         script_name=_require(environ, f'{_ENV_PREFIX}_SCRIPT_NAME'),
         script_key=_require(environ, f'{_ENV_PREFIX}_SCRIPT_KEY'),
@@ -216,4 +210,5 @@ def load_user_token_config(environ: Mapping[str, str]) -> UserTokenConfig:
         email_claim=email_claim,
         assume_email_verified=raw_assume == 'true',
         oidc_algorithms=algorithms,
+        bind=_parse_bind(environ),
     )

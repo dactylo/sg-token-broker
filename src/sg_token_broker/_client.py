@@ -14,6 +14,7 @@ from sg_token_broker._config import CLIENT_ID_MAX_CHARS, is_client_id, is_creden
 from sg_token_broker._urlpolicy import require_https_or_loopback
 
 _ENV_PREFIX = 'SG_TOKEN_BROKER'
+_RATE_LIMITED_STATUS = 429
 _REFRESH_MARGIN_SECONDS = 60.0
 _RETRY_BACKOFF_SECONDS = 0.5
 _SERVER_ERROR_STATUS = 500
@@ -25,6 +26,10 @@ class BrokerClientError(Exception):
     """The broker could not be reached or refused the request."""
 
 
+class _BrokerUnavailableError(BrokerClientError):
+    """The broker was unreachable, failing, or rate limiting the client."""
+
+
 @dataclass(frozen=True)
 class ClientOptions:
     """Tunable timeouts and retry behavior for `BrokerClient`.
@@ -34,11 +39,15 @@ class ClientOptions:
         retries: Number of retries after the initial request attempt. Defaults
             to `2`.
         refresh_margin: Seconds before reported expiry when a cached token is
-            refreshed. Defaults to `60.0`.
+            refreshed. Defaults to `60.0`. The client asks the broker once in
+            this window. If the broker is unreachable, failing, or rate
+            limiting, or returns a token already inside the window, the client
+            keeps its token until the reported expiry.
 
     Raises:
-        ValueError: If `timeout` is non-finite or not greater than zero, or if
-            `retries` is negative.
+        ValueError: If `timeout` is non-finite or not greater than zero, if
+            `retries` is negative, or if `refresh_margin` is non-finite or
+            negative.
     """
 
     timeout: float = 10.0
@@ -46,11 +55,21 @@ class ClientOptions:
     refresh_margin: float = _REFRESH_MARGIN_SECONDS
 
     def __post_init__(self) -> None:
-        """Raise ValueError for non-finite or non-positive timeouts and negative retries."""
+        """Validate request timeouts, retry counts, and refresh margins.
+
+        Raises:
+            ValueError: If `timeout` is non-finite or not greater than zero,
+                `retries` is negative, or `refresh_margin` is non-finite or
+                negative.
+        """
         if not (math.isfinite(self.timeout) and self.timeout > 0):
             raise ValueError(f'timeout must be finite and greater than zero, got {self.timeout}')
         if self.retries < 0:
             raise ValueError(f'retries must be >= 0, got {self.retries}')
+        if not (math.isfinite(self.refresh_margin) and self.refresh_margin >= 0):
+            raise ValueError(
+                f'refresh_margin must be finite and >= 0 seconds, got {self.refresh_margin}'
+            )
 
 
 @dataclass(frozen=True)
@@ -131,7 +150,8 @@ class BrokerClient:
         self._options = options if options is not None else ClientOptions()
         self._session = session if session is not None else requests.Session()
         self._lock = threading.Lock()
-        self._cache: dict[tuple[str, str], TokenResponse] = {}
+        # Each cached token with the time to ask the broker for a newer one.
+        self._cache: dict[tuple[str, str], tuple[TokenResponse, datetime.datetime]] = {}
 
     @staticmethod
     def _detail(response: requests.Response) -> str:
@@ -143,11 +163,6 @@ class BrokerClient:
         if isinstance(body, dict):
             return str(cast('dict[str, object]', body).get('detail', ''))
         return ''
-
-    def _near_expiry(self, token: TokenResponse) -> bool:
-        """Return True if the token is within the refresh margin of expiry."""
-        now = datetime.datetime.now(datetime.UTC)
-        return (token.expires_at - now).total_seconds() <= self._options.refresh_margin
 
     @staticmethod
     def _parse(body: object) -> TokenResponse:
@@ -175,9 +190,22 @@ class BrokerClient:
             expires_at=expires_at,
         )
 
+    def _refresh_at(self, token: TokenResponse) -> datetime.datetime:
+        """Return the margin before expiry, or expiry for a token already inside the margin."""
+        early = token.expires_at - datetime.timedelta(seconds=self._options.refresh_margin)
+        return early if early > datetime.datetime.now(datetime.UTC) else token.expires_at
+
+    def _server_error(self, response: requests.Response) -> _BrokerUnavailableError:
+        """Describe a broker server error using its response detail when present."""
+        message = f'broker request failed with HTTP {response.status_code}'
+        detail = self._detail(response)
+        if detail:
+            message += f': {detail}'
+        return _BrokerUnavailableError(message)
+
     def _request_token(self, scope: str, token_type: str) -> TokenResponse:
         """Request a broker token with retries for transient failures."""
-        last_error: Exception | None = None
+        last_error = _BrokerUnavailableError(f'cannot reach broker at {self._broker_url}')
         for attempt in range(self._options.retries + 1):
             if attempt:
                 time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
@@ -189,13 +217,22 @@ class BrokerClient:
                     timeout=self._options.timeout,
                 )
             except requests.RequestException as exc:
-                last_error = exc
+                last_error = _BrokerUnavailableError(
+                    f'cannot reach broker at {self._broker_url}: {exc}'
+                )
                 continue
+            except OSError as exc:
+                raise BrokerClientError(f'broker request could not be sent: {exc}') from exc
             if response.status_code >= _SERVER_ERROR_STATUS:
-                last_error = BrokerClientError(f'broker returned HTTP {response.status_code}')
+                last_error = self._server_error(response)
                 continue
             if response.status_code != _SUCCESS_STATUS:
-                raise BrokerClientError(
+                error = (
+                    _BrokerUnavailableError
+                    if response.status_code == _RATE_LIMITED_STATUS
+                    else BrokerClientError
+                )
+                raise error(
                     f'broker refused (HTTP {response.status_code}): {self._detail(response)}'
                 )
             try:
@@ -208,31 +245,49 @@ class BrokerClient:
             if token.token_type != token_type:
                 raise BrokerClientError('broker response token_type does not match the request')
             return token
-        raise BrokerClientError(f'cannot reach broker at {self._broker_url}: {last_error}')
+        raise last_error
 
-    def fetch_token(self, scope: str, token_type: str = _SESSION_TYPE) -> TokenResponse:
+    def fetch_token(
+        self, scope: str, token_type: str = _SESSION_TYPE, *, force_refresh: bool = False
+    ) -> TokenResponse:
         """Return a token for the scope, fetching from the broker as needed.
 
         Args:
             scope: Broker scope name (e.g. `read_all`).
             token_type: `session` (default) or `rest`.
+            force_refresh: Discard this client's cached token for the scope and
+                token type before requesting one, for use after SG rejects it.
+                The broker can still return its own cached token: a REST token
+                for up to 60 seconds after minting, and a session token for its
+                configured session lifetime.
 
         Returns:
             The cached or newly fetched token. Refresh decisions use the
             broker-reported deadline; cached tokens are not probed for SG
-            acceptance.
+            acceptance. Inside the refresh margin, an unreachable, failing, or
+            rate-limiting broker yields the cached token until that deadline.
 
         Raises:
-            BrokerClientError: If the broker is unreachable, refuses the
-                request, or returns a malformed or mismatched response.
+            BrokerClientError: If the broker refuses the request or returns a
+                malformed or mismatched response, or if it is unreachable,
+                failing, or rate limiting and no unexpired token is cached.
         """
         key = (scope, token_type)
         with self._lock:
-            cached = self._cache.get(key)
-            if cached is not None and not self._near_expiry(cached):
+            if force_refresh:
+                self._cache.pop(key, None)
+            now = datetime.datetime.now(datetime.UTC)
+            cached, refresh_at = self._cache.get(key, (None, now))
+            if cached is not None and now < refresh_at:
                 return cached
-            fresh = self._request_token(scope, token_type)
-            self._cache[key] = fresh
+            try:
+                fresh = self._request_token(scope, token_type)
+            except _BrokerUnavailableError:
+                if cached is None or datetime.datetime.now(datetime.UTC) >= cached.expires_at:
+                    raise
+                self._cache[key] = (cached, cached.expires_at)
+                return cached
+            self._cache[key] = (fresh, self._refresh_at(fresh))
             return fresh
 
 

@@ -24,12 +24,6 @@ class OidcUnavailableError(Exception):
     """PyJWT is not installed (the 'oidc' extra is missing)."""
 
 
-class _CooldownClient(Protocol):
-    """Optional refresh-cooldown setting exposed by newer PyJWT clients."""
-
-    cooldown_duration: float
-
-
 class _JwkSetCache(Protocol):
     """PyJWT JWK-set cache operations used by the resolver."""
 
@@ -63,25 +57,50 @@ class _JwkClient(Protocol):
     """PyJWT JWK-client surface used by the resolver."""
 
     fetch_data: Callable[[], object]
-    jwk_set_cache: _JwkSetCache | None
+    cooldown_duration: float
 
     def get_signing_key(self, kid: str) -> _SigningKey:
         """Return the signing key matching a key id.
+
+        May fetch JWKS when no usable cached key is available.
 
         Args:
             kid: Provider key id.
 
         Returns:
             The matching signing key.
+
+        Raises:
+            jwt.PyJWTError: If the provider key set is invalid or no usable
+                matching signing key can be selected.
+            requests.RequestException: If the installed JWKS fetch callback
+                cannot retrieve the provider's keys.
         """
+        ...
+
+    @property
+    def jwk_set_cache(self) -> _JwkSetCache | None:
+        """Return the optional cache for JWK-set documents."""
         ...
 
 
 class _JwtModule(Protocol):
     """PyJWT module surface used by the resolver."""
 
-    PyJWKClientError: type[Exception]
-    get_unverified_header: Callable[[str], Mapping[str, object]]
+    PyJWKClientError = property(
+        lambda _self: Exception, doc='Return the PyJWT key-selection error type.'
+    )
+
+    def get_unverified_header(self, jwt: str) -> Mapping[str, object]:
+        """Return the token header without signature verification.
+
+        Args:
+            jwt: Compact-serialized token whose header is to be decoded.
+
+        Raises:
+            jwt.PyJWTError: If the token or its header cannot be decoded.
+        """
+        ...
 
 
 class _OidcTransportError(requests.RequestException):
@@ -107,10 +126,8 @@ class _SigningKeyResolver:
         self._last_attempt_at: float | None = None
         self._last_attempt_succeeded: bool | None = None
         self._lock = threading.Lock()
-        # PyJWT 2.14 added a second cooldown. Keep refresh timing under this
-        # resolver's clock while retaining compatibility with older clients.
-        if hasattr(self._jwk_client, 'cooldown_duration'):
-            cast('_CooldownClient', self._jwk_client).cooldown_duration = 0.0
+        # Disable PyJWT 2.14's cooldown so this resolver's clock controls refresh.
+        self._jwk_client.cooldown_duration = 0.0
         self._jwk_client.fetch_data = self._fetch_jwks
 
     def __call__(self, presented: str) -> _SigningKey:
@@ -157,7 +174,12 @@ def _fetch_json_without_redirects(
     http: requests.Session, url: str, timeout: float, name: str
 ) -> dict[str, object]:
     """Fetch a JSON object without redirects; provider failures raise RequestException."""
-    response = http.get(url, timeout=timeout, allow_redirects=False)
+    try:
+        response = http.get(url, timeout=timeout, allow_redirects=False)
+    except requests.RequestException:
+        raise
+    except OSError as exc:
+        raise _OidcTransportError(f'{name} could not be sent: {exc}') from exc
     if response.is_redirect or response.is_permanent_redirect:
         raise _OidcTransportError(f'{name} redirect not allowed')
     if response.status_code != _HTTP_OK:

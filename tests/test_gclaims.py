@@ -11,9 +11,9 @@ from sg_token_broker._gclaims import (
     Verifier,
 )
 
-AUDIENCE = 'client-id-123.apps.googleusercontent.com'
-DOMAIN = 'studio.example'
-EMAIL = 'jane.exec@studio.example'
+_AUDIENCE = 'client-id-123.apps.googleusercontent.com'
+_DOMAIN = 'studio.example'
+_EMAIL = 'jane.exec@studio.example'
 
 
 class TestOidcClaimsValidator:
@@ -96,8 +96,8 @@ class TestOidcClaimsValidator:
 class TestValidate:
     def test_accepts_valid_token(self) -> None:
         claims = _make_validator(_make_payload()).validate('Bearer goodvalue')
-        assert claims.email == EMAIL
-        assert claims.audience == AUDIENCE
+        assert claims.email == _EMAIL
+        assert claims.audience == _AUDIENCE
 
     @pytest.mark.parametrize('header', ['Bearer', 'Bearer   '])
     def test_bearer_without_credential_is_rejected(self, header: str) -> None:
@@ -106,7 +106,7 @@ class TestValidate:
 
     def test_email_is_lowercased(self) -> None:
         payload = _make_payload(email='Jane.Exec@Studio.Example')
-        assert _make_validator(payload).validate('Bearer goodvalue').email == EMAIL
+        assert _make_validator(payload).validate('Bearer goodvalue').email == _EMAIL
 
     def test_empty_header_is_rejected(self) -> None:
         with pytest.raises(ClaimsError, match='Authorization'):
@@ -114,11 +114,11 @@ class TestValidate:
 
     def test_hd_case_is_normalized(self) -> None:
         payload = _make_payload(hd='Studio.Example')
-        assert _make_validator(payload).validate('Bearer goodvalue').email == EMAIL
+        assert _make_validator(payload).validate('Bearer goodvalue').email == _EMAIL
 
     def test_list_audience_is_rejected(self) -> None:
         with pytest.raises(ClaimsError, match='audience'):
-            _make_validator(_make_payload(aud=[AUDIENCE])).validate('Bearer goodvalue')
+            _make_validator(_make_payload(aud=[_AUDIENCE])).validate('Bearer goodvalue')
 
     @pytest.mark.parametrize(
         'email',
@@ -191,7 +191,7 @@ class TestValidate:
             raise ValueError(f'bad signature on {presented}')
 
         with pytest.raises(ClaimsError, match='verification failed'):
-            ClaimsValidator(verify, [AUDIENCE], DOMAIN).validate('Bearer forged')
+            ClaimsValidator(verify, [_AUDIENCE], _DOMAIN).validate('Bearer forged')
 
     def test_wrong_domain_is_rejected(self) -> None:
         payload = _make_payload(email='intruder@evil.example')
@@ -214,17 +214,17 @@ def _constant_verifier(payload: Mapping[str, object]) -> Verifier:
 
 def _make_payload(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
-        'aud': AUDIENCE,
-        'email': EMAIL,
+        'aud': _AUDIENCE,
+        'email': _EMAIL,
         'email_verified': True,
-        'hd': DOMAIN,
+        'hd': _DOMAIN,
     }
     payload.update(overrides)
     return payload
 
 
 def _make_validator(payload: Mapping[str, object]) -> ClaimsValidator:
-    return ClaimsValidator(_constant_verifier(payload), [AUDIENCE, 'second-aud'], DOMAIN)
+    return ClaimsValidator(_constant_verifier(payload), [_AUDIENCE, 'second-aud'], _DOMAIN)
 
 
 def _payload(**overrides: object) -> dict[str, object]:

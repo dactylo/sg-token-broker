@@ -57,5 +57,9 @@ def google_auth_verifier() -> Verifier:
             raise
         except exceptions.GoogleAuthError as exc:
             raise ValueError(str(exc)) from exc
+        except OSError as exc:
+            raise exceptions.TransportError(
+                f'Google certificate request could not be sent: {exc}'
+            ) from exc
 
     return verify

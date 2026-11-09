@@ -33,8 +33,8 @@ class ClaimsValidator:
         Args:
             verifier: Checks the token signature and expiry and returns its
                 claims, raising `ValueError` for an invalid token.
-            audiences: Accepted Cloud Run custom audience values, such as the
-                calling scripts' OAuth client IDs.
+            audiences: Accepted ID-token audience values, such as Apps Script
+                or installed-app OAuth client IDs.
             allowed_domain: Email domain without `@` that callers and the
                 token's `hd` claim must match.
         """
@@ -54,6 +54,8 @@ class ClaimsValidator:
         Raises:
             ClaimsError: If the header is malformed, the signature/expiry check
                 fails, or any claim check fails.
+            Exception: If the identity provider cannot be queried; the
+                verifier's operational exception propagates unchanged.
         """
         presented = _extract_bearer(authorization)
         try:
@@ -145,6 +147,8 @@ class OidcClaimsValidator:
         Raises:
             ClaimsError: If the header is malformed, verification fails, or any
                 claim check fails.
+            Exception: If the identity provider cannot be queried; the
+                verifier's operational exception propagates unchanged.
         """
         presented = _extract_bearer(authorization)
         try:

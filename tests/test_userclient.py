@@ -6,10 +6,13 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import cast
+from unittest.mock import Mock
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+import requests
 
 from sg_token_broker import UserTokenClient, UserTokenClientError
 from sg_token_broker._userauth import SignInError
@@ -94,15 +97,17 @@ class TestUserTokenClient:
         client.fetch_token('session', force_refresh=True)
         assert 'refresh=true' in fake_service.last_query
 
-    def test_four_part_id_token_is_a_client_error(self, fake_service: _FakeService) -> None:
+    @pytest.mark.usefixtures('no_requests')
+    def test_four_part_id_token_is_a_client_error(self) -> None:
         id_token = f'{_idt("jane")}.extra'
-        client = UserTokenClient(fake_service.url, id_token_source=lambda: id_token)
+        client = UserTokenClient('https://service.example', id_token_source=lambda: id_token)
         with pytest.raises(UserTokenClientError, match='sub'):
             client.fetch_token('session')
 
-    def test_id_token_without_sub_is_a_client_error(self, fake_service: _FakeService) -> None:
+    @pytest.mark.usefixtures('no_requests')
+    def test_id_token_without_sub_is_a_client_error(self) -> None:
         id_token = _idt_from_payload({})
-        client = UserTokenClient(fake_service.url, id_token_source=lambda: id_token)
+        client = UserTokenClient('https://service.example', id_token_source=lambda: id_token)
         with pytest.raises(UserTokenClientError, match='sub'):
             client.fetch_token('session')
 
@@ -120,21 +125,6 @@ class TestUserTokenClient:
         assert 'alice' in third.token
         assert first.token != third.token
         assert fake_service.request_count == 3
-
-    @pytest.mark.parametrize(
-        'timeout',
-        [0.0, -1.0, float('nan'), float('inf'), float('-inf')],
-    )
-    def test_invalid_timeouts_raise(self, timeout: float) -> None:
-        with pytest.raises(
-            UserTokenClientError,
-            match='timeout must be finite and greater than zero',
-        ):
-            UserTokenClient(
-                'https://user-token.example',
-                id_token_source=lambda: _idt('jane'),
-                timeout=timeout,
-            )
 
     def test_mismatched_token_type_is_rejected(self, fake_service: _FakeService) -> None:
         fake_service.respond_as = 'rest'
@@ -159,6 +149,60 @@ class TestUserTokenClient:
         client.fetch_token('rest')
         client.fetch_token('rest')
         assert fake_service.request_count == 2
+
+    @pytest.mark.parametrize(
+        ('status', 'body', 'message'),
+        [
+            (
+                403,
+                {'error': 'forbidden', 'detail': 'token type not allowed for this deployment'},
+                'service refused (HTTP 403 forbidden): token type not allowed for this deployment',
+            ),
+            (502, ValueError('HTML body'), 'service refused (HTTP 502)'),
+        ],
+    )
+    def test_service_rejection_reports_available_details(
+        self, status: int, body: dict[str, str] | ValueError, message: str
+    ) -> None:
+        response = Mock(status_code=status)
+        response.json = (
+            Mock(side_effect=body) if isinstance(body, ValueError) else Mock(return_value=body)
+        )
+        session = Mock(get=Mock(return_value=response))
+        client = UserTokenClient(
+            'https://service.example',
+            id_token_source=lambda: _idt('jane'),
+            session=cast('requests.Session', session),
+        )
+
+        with pytest.raises(UserTokenClientError) as caught:
+            client.fetch_token('session')
+
+        assert str(caught.value) == message
+
+    @pytest.mark.parametrize(
+        'timeout',
+        [0.0, -1.0, float('nan'), float('inf'), float('-inf')],
+    )
+    def test_invalid_timeouts_raise(self, timeout: float) -> None:
+        with pytest.raises(
+            UserTokenClientError,
+            match='timeout must be finite and greater than zero',
+        ):
+            UserTokenClient(
+                'https://user-token.example',
+                id_token_source=lambda: _idt('jane'),
+                timeout=timeout,
+            )
+
+    @pytest.mark.parametrize('margin', [-1.0, float('nan'), float('inf'), float('-inf')])
+    def test_invalid_refresh_margins_raise(self, margin: float) -> None:
+        with pytest.raises(UserTokenClientError, match='refresh_margin must be finite and >= 0'):
+            UserTokenClient(
+                'https://user-token.example',
+                id_token_source=lambda: _idt('jane'),
+                refresh_margin=margin,
+            )
 
     def test_session_is_cached_until_force_refresh(
         self, fake_service: _FakeService, monkeypatch: pytest.MonkeyPatch
@@ -187,12 +231,13 @@ class TestUserTokenClient:
         with pytest.raises(UserTokenClientError, match='expires_at'):
             client.fetch_token('session')
 
-    def test_sign_in_failures_surface_as_client_errors(self, fake_service: _FakeService) -> None:
+    @pytest.mark.usefixtures('no_requests')
+    def test_sign_in_failures_surface_as_client_errors(self) -> None:
 
         def failing_source() -> str:
             raise SignInError('browser timeout')
 
-        client = UserTokenClient(fake_service.url, id_token_source=failing_source)
+        client = UserTokenClient('https://service.example', id_token_source=failing_source)
         with pytest.raises(UserTokenClientError, match='sign-in failed'):
             client.fetch_token('session')
 
@@ -209,14 +254,31 @@ class TestUserTokenClient:
         assert len(calls) == 2
         assert fake_service.request_count == 1
 
-    def test_two_part_id_token_is_a_client_error(self, fake_service: _FakeService) -> None:
+    def test_transport_error_includes_original_message(self) -> None:
+        session = Mock(get=Mock(side_effect=requests.ConnectionError('connection lost')))
+        client = UserTokenClient(
+            'https://service.example',
+            id_token_source=lambda: _idt('jane'),
+            session=cast('requests.Session', session),
+        )
+
+        with pytest.raises(UserTokenClientError) as caught:
+            client.fetch_token('session')
+
+        assert str(caught.value) == (
+            'cannot reach user-token service at https://service.example: connection lost'
+        )
+
+    @pytest.mark.usefixtures('no_requests')
+    def test_two_part_id_token_is_a_client_error(self) -> None:
         id_token = _idt('jane').removesuffix('.')
-        client = UserTokenClient(fake_service.url, id_token_source=lambda: id_token)
+        client = UserTokenClient('https://service.example', id_token_source=lambda: id_token)
         with pytest.raises(UserTokenClientError, match='sub'):
             client.fetch_token('session')
 
-    def test_unknown_requested_token_type_is_rejected(self, fake_service: _FakeService) -> None:
-        client = UserTokenClient(fake_service.url, id_token_source=lambda: _idt('jane'))
+    @pytest.mark.usefixtures('no_requests')
+    def test_unknown_requested_token_type_is_rejected(self) -> None:
+        client = UserTokenClient('https://service.example', id_token_source=lambda: _idt('jane'))
         with pytest.raises(UserTokenClientError, match='token_type'):
             client.fetch_token('bearer')
 
@@ -314,3 +376,22 @@ def fake_service() -> Iterator[_FakeService]:
         server.shutdown()
         thread.join()
         server.server_close()
+
+
+def test_missing_ca_bundle_is_a_setup_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / 'missing-ca.pem'
+    monkeypatch.setenv('REQUESTS_CA_BUNDLE', str(missing))
+    monkeypatch.setattr(
+        'urllib3.connection.HTTPSConnection.connect',
+        Mock(side_effect=AssertionError('unexpected connection')),
+    )
+    with pytest.raises(UserTokenClientError) as caught:
+        UserTokenClient('https://127.0.0.1:1', id_token_source=lambda: _idt('jane')).fetch_token()
+    assert isinstance(caught.value.__cause__, OSError)
+    assert not isinstance(caught.value.__cause__, requests.RequestException)
+    assert str(caught.value) == 'user-token request could not be sent: ' + str(
+        caught.value.__cause__
+    )
+    assert str(missing) in str(caught.value)

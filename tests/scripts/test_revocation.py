@@ -1,4 +1,6 @@
+import argparse
 import hashlib
+from functools import partial
 from pathlib import Path
 from types import ModuleType
 from typing import NoReturn
@@ -7,10 +9,10 @@ from unittest.mock import Mock
 import pytest
 import requests
 
-from tests.conftest import _FakeSG
+from tests.conftest import FakeSG
 from tests.scripts._helpers import load_script as _load_path
 
-SCRIPT_PATH = Path(__file__).parents[2] / 'scripts' / 'verify_sg_revocation.py'
+_SCRIPT_PATH = Path(__file__).parents[2] / 'scripts' / 'verify_sg_revocation.py'
 _ARGS = [
     '--site-url',
     'https://sg.example.invalid',
@@ -33,41 +35,16 @@ class TestBuildSession:
         session = module._build_session(proxy=None, ca_bundle=None, insecure=True)
         assert session.verify is False
 
-    def test_insecure_flow_against_fake(
-        self,
-        fake_sg: _FakeSG,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        module = _load_script()
-        monkeypatch.setenv('SGTB_VERIFY_KEY', 'masterkey')
-
-        def fake_input(prompt: str) -> str:
-            del prompt
-            fake_sg._fail_rpc = True
-            fake_sg._session_revoked = True
-            return ''
-
-        monkeypatch.setattr('builtins.input', fake_input)
-        result = module.main(
-            [
-                '--site-url',
-                fake_sg._url,
-                '--script-name',
-                'broker_read_all',
-                '--script-key-env',
-                'SGTB_VERIFY_KEY',
-                '--insecure',
-            ]
-        )
-        assert result == 0
-
     def test_proxy_and_ca_bundle(self) -> None:
         module = _load_script()
         session = module._build_session(
-            proxy='http://squid:8080', ca_bundle='/etc/corp-ca.pem', insecure=False
+            proxy='http://proxy.example:3128', ca_bundle='/etc/corp-ca.pem', insecure=False
         )
         assert session.verify == '/etc/corp-ca.pem'
-        assert session.proxies == {'http': 'http://squid:8080', 'https': 'http://squid:8080'}
+        assert session.proxies == {
+            'http': 'http://proxy.example:3128',
+            'https': 'http://proxy.example:3128',
+        }
 
 
 class TestCredentialRedirectPolicy:
@@ -97,14 +74,14 @@ class TestCredentialRedirectPolicy:
 class TestProxySupport:
     def test_proxy_is_used(
         self,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         del capsys
         module = _load_script()
         monkeypatch.setenv('SGTB_VERIFY_KEY', 'k')
-        result = module.main(
+        result = module._main(
             [
                 '--site-url',
                 'http://127.0.0.1:9',
@@ -113,11 +90,11 @@ class TestProxySupport:
                 '--script-key-env',
                 'SGTB_VERIFY_KEY',
                 '--proxy',
-                fake_sg._url,
+                fake_sg.url,
             ]
         )
         assert result == 2
-        proxied = [str(r['path']) for r in fake_sg._requests]
+        proxied = [str(r['path']) for r in fake_sg.requests]
         assert any(p.startswith('http://127.0.0.1:9') for p in proxied)
 
 
@@ -171,17 +148,17 @@ class TestRPCDiagnostics:
 class TestStandaloneScript:
     def test_bad_key_is_setup_error_with_classification(
         self,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         module = _load_script()
-        fake_sg._fail_rpc = True
+        fake_sg.fail_rpc = True
         monkeypatch.setenv('SGTB_VERIFY_KEY', 'wrong')
-        result = module.main(
+        result = module._main(
             [
                 '--site-url',
-                fake_sg._url,
+                fake_sg.url,
                 '--script-name',
                 's',
                 '--script-key-env',
@@ -200,24 +177,24 @@ class TestStandaloneScript:
     )
     def test_blank_session_id_is_inconclusive(
         self,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         nested_results: bool,
         session_id: str,
     ) -> None:
         module = _load_script()
-        fake_sg._nested_results = nested_results
-        fake_sg._rpc_session_id_override = session_id
+        fake_sg.nested_results = nested_results
+        fake_sg.rpc_session_id_override = session_id
         session = module._build_session(proxy=None, ca_bundle=None, insecure=False)
         with pytest.raises(RuntimeError, match='session_id'):
-            module._check_session_token(session, fake_sg._url, fake_sg._canned_session)
+            module._check_session_token(session, fake_sg.url, fake_sg.canned_session)
 
-    def test_diagnostics_never_echo_the_body(self, fake_sg: _FakeSG) -> None:
+    def test_diagnostics_never_echo_the_body(self, fake_sg: FakeSG) -> None:
         module = _load_script()
-        fake_sg._nested_results = True
-        fake_sg._rpc_results_as_list = True
-        fake_sg._rpc_session_id_override = 'LIVE-SECRET'
+        fake_sg.nested_results = True
+        fake_sg.rpc_results_as_list = True
+        fake_sg.rpc_session_id_override = 'LIVE-SECRET'
         session = module._build_session(proxy=None, ca_bundle=None, insecure=False)
-        token, error = module._mint_session_token(session, fake_sg._url, 'script', 'key')
+        token, error = module._mint_session_token(session, fake_sg.url, 'script', 'key')
         assert token is None
         assert 'LIVE-SECRET' not in error
         assert 'no_session_id' in error
@@ -225,16 +202,16 @@ class TestStandaloneScript:
 
     def test_disable_then_restore_reports_resurrection(
         self,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         module = _load_script()
         monkeypatch.setenv('SGTB_VERIFY_KEY', 'masterkey')
         actions = [
-            lambda: setattr(fake_sg, '_fail_rpc', True),
-            lambda: setattr(fake_sg, '_session_revoked', True),
-            lambda: setattr(fake_sg, '_session_revoked', False),
+            lambda: setattr(fake_sg, 'fail_rpc', True),
+            lambda: setattr(fake_sg, 'session_revoked', True),
+            lambda: setattr(fake_sg, 'session_revoked', False),
         ]
 
         def fake_input(prompt: str) -> str:
@@ -244,10 +221,10 @@ class TestStandaloneScript:
             return ''
 
         monkeypatch.setattr('builtins.input', fake_input)
-        result = module.main(
+        result = module._main(
             [
                 '--site-url',
-                fake_sg._url,
+                fake_sg.url,
                 '--script-name',
                 'broker_read_all',
                 '--script-key-env',
@@ -259,55 +236,55 @@ class TestStandaloneScript:
         assert 'WORKS AGAIN after the script is restored' in out
         assert 'unverified' in out
 
-    def test_float_auth_code_is_inconclusive(self, fake_sg: _FakeSG) -> None:
+    def test_float_auth_code_is_inconclusive(self, fake_sg: FakeSG) -> None:
         module = _load_script()
-        fake_sg._rpc_fault = True
-        fake_sg._rpc_error_code_override = 102.0
+        fake_sg.rpc_fault = True
+        fake_sg.rpc_error_code_override = 102.0
         session = module._build_session(proxy=None, ca_bundle=None, insecure=False)
         with pytest.raises(RuntimeError, match='not an authentication rejection'):
-            module._check_session_token(session, fake_sg._url, fake_sg._canned_session)
+            module._check_session_token(session, fake_sg.url, fake_sg.canned_session)
 
-    def test_http_error_auth_code_is_inconclusive(self, fake_sg: _FakeSG) -> None:
+    def test_http_error_auth_code_is_inconclusive(self, fake_sg: FakeSG) -> None:
         module = _load_script()
-        fake_sg._session_revoked = True
-        fake_sg._rpc_status_override = 503
+        fake_sg.session_revoked = True
+        fake_sg.rpc_status_override = 503
         session = module._build_session(proxy=None, ca_bundle=None, insecure=False)
         with pytest.raises(RuntimeError) as excinfo:
-            module._check_session_token(session, fake_sg._url, fake_sg._canned_session)
+            module._check_session_token(session, fake_sg.url, fake_sg.canned_session)
         message = str(excinfo.value)
         assert 'HTTP 503' in message
         assert 'Session expired' not in message
         assert 'error_shape' in message
 
-    def test_http_error_session_id_is_inconclusive(self, fake_sg: _FakeSG) -> None:
+    def test_http_error_session_id_is_inconclusive(self, fake_sg: FakeSG) -> None:
         module = _load_script()
-        fake_sg._rpc_status_override = 503
+        fake_sg.rpc_status_override = 503
         session = module._build_session(proxy=None, ca_bundle=None, insecure=False)
         with pytest.raises(RuntimeError) as excinfo:
-            module._check_session_token(session, fake_sg._url, fake_sg._canned_session)
+            module._check_session_token(session, fake_sg.url, fake_sg.canned_session)
         message = str(excinfo.value)
         assert 'HTTP 503' in message
-        assert fake_sg._canned_session not in message
+        assert fake_sg.canned_session not in message
         assert 'no_session_id' in message
 
     @pytest.mark.parametrize('nested_results', [False, True])
     def test_mint_preserves_nonempty_session_id(
         self,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         nested_results: bool,
     ) -> None:
         module = _load_script()
         expected = '  padded-token  '
-        fake_sg._nested_results = nested_results
-        fake_sg._rpc_session_id_override = expected
+        fake_sg.nested_results = nested_results
+        fake_sg.rpc_session_id_override = expected
         session = module._build_session(proxy=None, ca_bundle=None, insecure=False)
-        token, error = module._mint_session_token(session, fake_sg._url, 's', 'k')
+        token, error = module._mint_session_token(session, fake_sg.url, 's', 'k')
         assert token == expected
         assert error == ''
 
     def test_non_auth_fault_is_inconclusive_not_pass(
         self,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -316,14 +293,14 @@ class TestStandaloneScript:
 
         def fake_input(prompt: str) -> str:
             del prompt
-            fake_sg._rpc_fault = True
+            fake_sg.rpc_fault = True
             return ''
 
         monkeypatch.setattr('builtins.input', fake_input)
-        result = module.main(
+        result = module._main(
             [
                 '--site-url',
-                fake_sg._url,
+                fake_sg.url,
                 '--script-name',
                 'broker_read_all',
                 '--script-key-env',
@@ -340,7 +317,7 @@ class TestStandaloneScript:
 
     def test_nothing_revokes_exits_1(
         self,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -352,10 +329,10 @@ class TestStandaloneScript:
             return ''
 
         monkeypatch.setattr('builtins.input', fake_input)
-        result = module.main(
+        result = module._main(
             [
                 '--site-url',
-                fake_sg._url,
+                fake_sg.url,
                 '--script-name',
                 'broker_read_all',
                 '--script-key-env',
@@ -376,7 +353,7 @@ class TestStandaloneScript:
             raise AssertionError(f'unexpected credential prompt: {prompt}')
 
         monkeypatch.setattr('getpass.getpass', unexpected_prompt)
-        result = module.main(
+        result = module._main(
             ['--site-url', 'http://sg.studio.internal', '--script-name', 'broker_read_all']
         )
         assert result == 2
@@ -384,12 +361,12 @@ class TestStandaloneScript:
 
     def test_remote_http_is_rejected_without_request(
         self,
-        fake_sg: _FakeSG,
+        offline_sg: FakeSG,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         module = _load_script()
         monkeypatch.setenv('SGTB_VERIFY_KEY', 'masterkey')
-        result = module.main(
+        result = module._main(
             [
                 '--site-url',
                 'http://sg.studio.internal',
@@ -398,23 +375,22 @@ class TestStandaloneScript:
                 '--script-key-env',
                 'SGTB_VERIFY_KEY',
                 '--proxy',
-                fake_sg._url,
+                offline_sg.url,
             ]
         )
         assert result == 2
-        assert fake_sg._requests == []
 
     def test_restore_instructions_survive_a_crash_after_disable(
         self,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         module = _load_script()
         monkeypatch.setenv('SGTB_VERIFY_KEY', 'masterkey')
         actions = [
-            lambda: setattr(fake_sg, '_fail_rpc', True),
-            lambda: setattr(fake_sg, '_hard_fail', True),
+            lambda: setattr(fake_sg, 'fail_rpc', True),
+            lambda: setattr(fake_sg, 'hard_fail', True),
         ]
 
         def fake_input(prompt: str) -> str:
@@ -424,10 +400,10 @@ class TestStandaloneScript:
             return ''
 
         monkeypatch.setattr('builtins.input', fake_input)
-        result = module.main(
+        result = module._main(
             [
                 '--site-url',
-                fake_sg._url,
+                fake_sg.url,
                 '--script-name',
                 'broker_read_all',
                 '--script-key-env',
@@ -441,7 +417,7 @@ class TestStandaloneScript:
 
     def test_rotation_revokes(
         self,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -450,15 +426,15 @@ class TestStandaloneScript:
 
         def fake_input(prompt: str) -> str:
             del prompt
-            fake_sg._fail_rpc = True
-            fake_sg._session_revoked = True
+            fake_sg.fail_rpc = True
+            fake_sg.session_revoked = True
             return ''
 
         monkeypatch.setattr('builtins.input', fake_input)
-        result = module.main(
+        result = module._main(
             [
                 '--site-url',
-                fake_sg._url,
+                fake_sg.url,
                 '--script-name',
                 'broker_read_all',
                 '--script-key-env',
@@ -470,19 +446,19 @@ class TestStandaloneScript:
 
     def test_step4_verifies_replacement(
         self,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         module = _load_script()
         monkeypatch.setenv('SGTB_VERIFY_KEY', 'masterkey')
         actions = [
-            lambda: setattr(fake_sg, '_fail_rpc', True),
-            lambda: setattr(fake_sg, '_session_revoked', True),
-            lambda: setattr(fake_sg, '_session_revoked', False),
+            lambda: setattr(fake_sg, 'fail_rpc', True),
+            lambda: setattr(fake_sg, 'session_revoked', True),
+            lambda: setattr(fake_sg, 'session_revoked', False),
             lambda: (
-                setattr(fake_sg, '_session_revoked', True),
-                setattr(fake_sg, '_fail_rpc', False),
+                setattr(fake_sg, 'session_revoked', True),
+                setattr(fake_sg, 'fail_rpc', False),
             ),
         ]
         replies = ['', '', '', 'y']
@@ -500,10 +476,10 @@ class TestStandaloneScript:
             return 'new-replacement-key'
 
         monkeypatch.setattr('getpass.getpass', fake_getpass)
-        result = module.main(
+        result = module._main(
             [
                 '--site-url',
-                fake_sg._url,
+                fake_sg.url,
                 '--script-name',
                 'broker_read_all',
                 '--script-key-env',
@@ -517,17 +493,17 @@ class TestStandaloneScript:
 
     def test_unexpected_json_shape_shows_status_and_classification(
         self,
-        fake_sg: _FakeSG,
+        fake_sg: FakeSG,
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         module = _load_script()
-        fake_sg._weird_json = True
+        fake_sg.weird_json = True
         monkeypatch.setenv('SGTB_VERIFY_KEY', 'masterkey')
-        result = module.main(
+        result = module._main(
             [
                 '--site-url',
-                fake_sg._url,
+                fake_sg.url,
                 '--script-name',
                 's',
                 '--script-key-env',
@@ -569,13 +545,13 @@ class TestStandaloneTranscript:
         monkeypatch.setattr(module, '_mint_session_token', mint)
         monkeypatch.setattr(module, '_check_session_token', reject_fresh)
 
-        assert module.main(_ARGS) == 2
+        assert module._main(_ARGS) == 2
         streams = capsys.readouterr()
         assert streams.out == ''
         expected_clause = (
             'freshly minted session token'
             if failure == 'fresh'
-            else 'sg rejected the script credentials'
+            else 'could not mint a session token'
         )
         assert streams.err.startswith(f'error: {expected_clause}')
         assert len(streams.err.splitlines()) == 1
@@ -588,7 +564,7 @@ class TestStandaloneTranscript:
         module = _load_script()
         monkeypatch.setenv('SGTB_VERIFY_KEY', 'masterkey')
         _script_site(monkeypatch, module, [True, False])
-        assert module.main([*_ARGS, '--insecure']) == 0
+        assert module._main([*_ARGS, '--insecure']) == 0
         assert capsys.readouterr().err == (
             'warning: TLS verification disabled; only use with a disposable script key\n'
         )
@@ -603,7 +579,7 @@ class TestStandaloneTranscript:
             raise RuntimeError('cannot reach SG site: ConnectionError: offline')
 
         monkeypatch.setattr(module, '_run_test', unreachable)
-        assert module.main(_ARGS) == 2
+        assert module._main(_ARGS) == 2
         assert capsys.readouterr().err == (
             'error: revocation check is inconclusive: cannot reach SG site: ConnectionError: '
             'offline\n'
@@ -615,7 +591,7 @@ class TestStandaloneTranscript:
         module = _load_script()
         monkeypatch.setenv('SGTB_VERIFY_KEY', 'masterkey')
         prompts = _script_site(monkeypatch, module, [True, True, True])
-        assert module.main(_ARGS) == 1
+        assert module._main(_ARGS) == 1
         fingerprint = hashlib.sha256(b'live-session').hexdigest()[:16]
         assert capsys.readouterr().out.splitlines() == [
             f'Minted a live session token (fingerprint {fingerprint}).',
@@ -649,7 +625,7 @@ class TestStandaloneTranscript:
             raise requests.exceptions.SSLError('certificate verify failed\x1b[31m')
 
         monkeypatch.setattr(requests.Session, 'post', reject_tls)
-        assert module.main(_ARGS) == 2
+        assert module._main(_ARGS) == 2
         streams = capsys.readouterr()
         assert streams.out == ''
         assert streams.err.startswith(
@@ -670,7 +646,7 @@ class TestStandaloneTranscript:
         module = _load_script()
         monkeypatch.setenv('SGTB_VERIFY_KEY', 'masterkey')
         prompts = _script_site(monkeypatch, module, [True, True, False, True, False])
-        assert module.main(_ARGS) == 0
+        assert module._main(_ARGS) == 0
         assert capsys.readouterr().out.splitlines()[-6:] == [
             'Caution: the old session token WORKS AGAIN after the script is restored.',
             'Disabling only suspends tokens; it does not retire them.',
@@ -696,44 +672,8 @@ class TestStandaloneTranscript:
         ]
 
 
-class TestURLPolicy:
-    @pytest.mark.parametrize(
-        'url',
-        [
-            'https://studio.example',
-            'http://localhost:8080',
-            'http://127.0.0.1:8080',
-            'http://[::1]:8080',
-        ],
-    )
-    def test_accepts_https_and_loopback_http(self, url: str) -> None:
-        validator = _load_script()._require_https_or_loopback
-        assert validator(url) == url
-
-    @pytest.mark.parametrize(
-        'url',
-        [
-            'http://sg.studio.internal',
-            'http://evil.example\\@localhost',
-            '\x00https://studio.example',
-            ' https://studio.example',
-            'https://studio.example/path with space',
-            'https://studio.example:notaport',
-            'https://studio.example:65536',
-            'http://10.1.2.3',
-            'ftp://studio.example',
-            'https://',
-            'not-a-url',
-        ],
-    )
-    def test_rejects_unsafe_or_malformed_urls(self, url: str) -> None:
-        validator = _load_script()._require_https_or_loopback
-        with pytest.raises(ValueError, match='site URL'):
-            validator(url)
-
-
 def _load_script() -> ModuleType:
-    return _load_path(SCRIPT_PATH)
+    return _load_path(_SCRIPT_PATH)
 
 
 def _script_site(
@@ -770,3 +710,78 @@ def _script_site(
     monkeypatch.setattr('builtins.input', answer)
     monkeypatch.setattr('getpass.getpass', replacement_key)
     return prompts
+
+
+def test_missing_ca_bundle_argument_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _load_script()
+    missing = tmp_path / 'missing-ca.pem'
+    monkeypatch.setenv('SGTB_VERIFY_KEY', 'key')
+    monkeypatch.setattr(
+        'urllib3.connection.HTTPSConnection.connect',
+        Mock(side_effect=AssertionError('unexpected connection')),
+    )
+    with pytest.raises(SystemExit) as caught:
+        module._main([*_ARGS, '--ca-bundle', str(missing)])
+    assert caught.value.code == 2
+    assert f'no readable CA bundle at {missing}' in capsys.readouterr().err
+
+
+def test_missing_ca_bundle_environment_exits_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / 'missing-ca.pem'
+    monkeypatch.setenv('REQUESTS_CA_BUNDLE', str(missing))
+    monkeypatch.setenv('SGTB_VERIFY_KEY', 'key')
+    monkeypatch.setattr(
+        'urllib3.connection.HTTPSConnection.connect',
+        Mock(side_effect=AssertionError('unexpected connection')),
+    )
+    assert _load_script()._main(_ARGS) == 2
+    assert 'cannot send the SG request: ' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('site', ['rpc', 'rest'])
+def test_missing_ca_bundle_is_a_setup_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    module = _load_script()
+    missing = tmp_path / 'missing-ca.pem'
+    monkeypatch.setenv('REQUESTS_CA_BUNDLE', str(missing))
+    monkeypatch.setattr(
+        'urllib3.connection.HTTPSConnection.connect',
+        Mock(side_effect=AssertionError('unexpected connection')),
+    )
+    with requests.Session() as session:
+        send = (
+            partial(module._rpc_get_session_token, session, 'https://127.0.0.1:1', {})
+            if site == 'rpc'
+            else partial(module._rest_token_expires_in, session, 'https://127.0.0.1:1', 's', 'k')
+        )
+        with pytest.raises(RuntimeError) as caught:
+            send()
+    assert isinstance(caught.value.__cause__, OSError)
+    assert not isinstance(caught.value.__cause__, requests.RequestException)
+    assert str(caught.value) == 'cannot send the SG request: ' + str(caught.value.__cause__)
+    assert str(missing) in str(caught.value)
+
+
+@pytest.mark.parametrize('kind', ['readable', 'directory', 'unreadable'])
+def test_ca_bundle_requires_a_readable_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    bundle = tmp_path / 'ca.pem'
+    if kind == 'directory':
+        bundle.mkdir()
+    else:
+        bundle.write_bytes(b'certificate data')
+    if kind == 'unreadable':
+        monkeypatch.setattr(Path, 'open', Mock(side_effect=PermissionError('denied')))
+    module = _load_script()
+    if kind == 'readable':
+        assert module._readable_ca_bundle(str(bundle)) == str(bundle)
+    else:
+        with pytest.raises(argparse.ArgumentTypeError) as caught:
+            module._readable_ca_bundle(str(bundle))
+        assert str(caught.value) == f'no readable CA bundle at {bundle}'

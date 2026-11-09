@@ -1,9 +1,11 @@
 import logging
 import socket
+import socketserver
 import threading
 from collections.abc import Iterator
 from http.client import HTTPMessage
 from http.server import BaseHTTPRequestHandler
+from unittest.mock import Mock
 
 import pytest
 import requests
@@ -11,6 +13,40 @@ import requests
 from sg_token_broker._http import _BrokerHTTPServer
 from sg_token_broker._httpbase import BoundedThreadingHTTPServer, parse_content_length
 from sg_token_broker._userhttp import _UserTokenHTTPServer
+
+
+class TestAddressFamily:
+    @pytest.mark.parametrize(
+        ('host', 'expected_family'),
+        [
+            ('::1', socket.AF_INET6),
+            ('2001:db8::1', socket.AF_INET6),
+            ('127.0.0.1', socket.AF_INET),
+            ('localhost', socket.AF_INET),
+        ],
+    )
+    def test_family_is_selected_before_socket_creation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        host: str,
+        expected_family: socket.AddressFamily,
+    ) -> None:
+        families: list[int] = []
+
+        def record_family(
+            server: BoundedThreadingHTTPServer,
+            address: tuple[str, int],
+            handler: type[BaseHTTPRequestHandler],
+            bind_and_activate: bool = True,
+        ) -> None:
+            assert address == (host, 0)
+            assert handler is _OKHandler
+            assert bind_and_activate
+            families.append(server.address_family)
+
+        monkeypatch.setattr(socketserver.TCPServer, '__init__', record_family)
+        BoundedThreadingHTTPServer((host, 0), _OKHandler)
+        assert families == [expected_family]
 
 
 class TestContentLength:
@@ -99,6 +135,24 @@ class TestServerErrorLogging:
 
 
 class TestWorkerCap:
+    @pytest.mark.parametrize('failure', [None, RuntimeError('handler failed')])
+    def test_completed_request_restores_capacity(
+        self, monkeypatch: pytest.MonkeyPatch, failure: RuntimeError | None
+    ) -> None:
+        server = _QuietServer(('127.0.0.1', 0), _OKHandler, bind_and_activate=False)
+        server._worker_slots = threading.BoundedSemaphore(1)
+        finish = Mock(side_effect=failure)
+        monkeypatch.setattr(server, 'finish_request', finish)
+        try:
+            assert server._worker_slots.acquire(blocking=False)
+            with socket.socket() as request:
+                server.process_request_thread(request, ('127.0.0.1', 1))
+                finish.assert_called_once_with(request, ('127.0.0.1', 1))
+            assert server._worker_slots.acquire(blocking=False)
+            assert not server._worker_slots.acquire(blocking=False)
+        finally:
+            server.server_close()
+
     def test_connections_beyond_cap_are_closed_and_shutdown_stays_bounded(
         self, capped_server: tuple[BoundedThreadingHTTPServer, str, int]
     ) -> None:

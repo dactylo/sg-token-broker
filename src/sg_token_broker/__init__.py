@@ -1,4 +1,4 @@
-"""sg-token-broker: temporary, scoped, audited SG credentials.
+"""sg-token-broker: brokered, audited SG credentials.
 
 The broker services hold master SG script keys and dispense SG session or REST
 tokens to authenticated callers. REST tokens have a hard SG expiry, while

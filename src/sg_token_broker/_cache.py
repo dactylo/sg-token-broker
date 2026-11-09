@@ -1,11 +1,9 @@
 """Provide a thread-safe TTL cache with per-key singleflight."""
 
-# pyright: reportPrivateUsage=false
-
 import threading
 import time
 from collections.abc import Callable, Hashable
-from typing import Generic, TypeVar, cast
+from typing import Generic, TypeVar
 
 _T = TypeVar('_T')
 
@@ -15,10 +13,28 @@ class _InFlight(Generic[_T]):
 
     def __init__(self) -> None:
         """Create an unpublished cache flight with a completion event."""
-        self._done = threading.Event()
-        self._error: BaseException | None = None
-        self._kept: bool | None = None
-        self._value: _T | None = None
+        self.done = threading.Event()
+        self.error: BaseException | None = None
+        self.outcome: tuple[_T, bool] | None = None
+
+    def wait(self) -> tuple[_T, bool]:
+        """Wait for the owner, then return its published outcome or raise its error.
+
+        Returns:
+            The owner's value and operation-specific flag. `get_or_create`
+            publishes `False` for its new value; its waiter reports a cache hit
+            separately. `revalidate_or_replace` publishes `True` when it keeps
+            a cached value and `False` when it creates or replaces one.
+
+        Raises:
+            BaseException: If the owner failed while producing the outcome.
+        """
+        self.done.wait()
+        if self.error is not None:
+            raise self.error
+        if self.outcome is None:
+            raise RuntimeError('cache flight completed without an outcome')
+        return self.outcome
 
 
 class TTLCache(Generic[_T]):
@@ -34,6 +50,13 @@ class TTLCache(Generic[_T]):
         self._entries: dict[Hashable, tuple[_T, float]] = {}
         self._in_flight: dict[Hashable, _InFlight[_T]] = {}
         self._master_lock = threading.Lock()
+
+    def _fail_flight(self, key: Hashable, flight: _InFlight[_T], exc: BaseException) -> None:
+        """Publish a flight failure before removing it from in-progress work."""
+        flight.error = exc
+        flight.done.set()
+        with self._master_lock:
+            del self._in_flight[key]
 
     def _lookup(self, key: Hashable) -> tuple[_T, bool] | None:
         """Return a live cached value for key, or None."""
@@ -89,25 +112,18 @@ class TTLCache(Generic[_T]):
             else:
                 is_owner = False
         if not is_owner:
-            flight._done.wait()
-            if flight._error is not None:
-                raise flight._error
-            return cast('_T', flight._value), True
+            return flight.wait()[0], True
         try:
             value = factory()
         except BaseException as exc:
-            flight._error = exc
-            flight._done.set()
-            with self._master_lock:
-                del self._in_flight[key]
+            self._fail_flight(key, flight, exc)
             raise
         with self._master_lock:
             self._prune_expired()
             self._entries[key] = (value, self._clock() + ttl)
             del self._in_flight[key]
-        flight._value = value
-        flight._kept = False
-        flight._done.set()
+        flight.outcome = (value, False)
+        flight.done.set()
         return value, False
 
     def revalidate_or_replace(
@@ -154,13 +170,7 @@ class TTLCache(Generic[_T]):
                 is_owner = False
             cached = self._lookup(key)
         if not is_owner:
-            flight._done.wait()
-            if flight._error is not None:
-                raise flight._error
-            kept = flight._kept
-            if kept is None:
-                raise RuntimeError('cache flight completed without an outcome')
-            return cast('_T', flight._value), kept
+            return flight.wait()
         try:
             if cached is not None and validate(cached[0]):
                 value, kept = cached[0], True
@@ -173,17 +183,13 @@ class TTLCache(Generic[_T]):
                         self._entries.pop(key, None)
                 value, kept = factory(), False
         except BaseException as exc:
-            flight._error = exc
-            flight._done.set()
-            with self._master_lock:
-                del self._in_flight[key]
+            self._fail_flight(key, flight, exc)
             raise
-        flight._value = value
-        flight._kept = kept
+        flight.outcome = (value, kept)
         with self._master_lock:
             if not kept:
                 self._prune_expired()
                 self._entries[key] = (value, self._clock() + ttl)
             del self._in_flight[key]
-        flight._done.set()
+        flight.done.set()
         return value, kept

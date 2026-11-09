@@ -6,10 +6,11 @@ from sg_token_broker import _verify
 from sg_token_broker._secrets import token_fingerprint
 from sg_token_broker._sg import MintedToken, SGError, SGMinter
 from sg_token_broker._verify import run_revocation_check
-from tests.conftest import _FakeSG
+from tests.conftest import FakeSG
 
-_EXIT_NOT_REVOKED = _verify._EXIT_NOT_REVOKED
-_EXIT_REVOKED = _verify._EXIT_REVOKED
+# Documented exit codes of `sg-token-broker verify-revocation`.
+_EXIT_NOT_REVOKED = 1
+_EXIT_REVOKED = 0
 _MINTED = f'Minted a live session token (fingerprint {token_fingerprint("live-session")}).'
 _REST_NOTE = 'Note: REST access tokens on this site expire in 600s (site pref).'
 _RESTORE = (
@@ -34,94 +35,94 @@ _SURVIVED_ROTATION = [
 
 
 class TestRunRevocationCheck:
-    def test_bad_key_is_setup_error(self, fake_sg: _FakeSG) -> None:
-        fake_sg._fail_rpc = True
+    def test_bad_key_is_setup_error(self, fake_sg: FakeSG) -> None:
+        fake_sg.fail_rpc = True
         io = _ScriptedIO([])
         with pytest.raises(_verify.VerifySetupError, match='could not mint a session token'):
             _run(fake_sg, io)
-        assert io._lines == []
+        assert io.lines == []
 
-    def test_disable_revokes_and_stays_dead_after_restore(self, fake_sg: _FakeSG) -> None:
+    def test_disable_revokes_and_stays_dead_after_restore(self, fake_sg: FakeSG) -> None:
         def rotate_only() -> None:
-            fake_sg._fail_rpc = True
+            fake_sg.fail_rpc = True
 
         def disable() -> None:
-            fake_sg._session_revoked = True
+            fake_sg.session_revoked = True
 
         io = _ScriptedIO([rotate_only, disable, lambda: None])
         assert _run(fake_sg, io) == _EXIT_REVOKED
-        out = io._text()
+        out = io.text()
         assert 'SURVIVED key rotation' in out
         assert 'disabling the ApiUser revoked' in out
         assert 'stay dead after the script is restored' in out
 
-    def test_disable_revokes_but_token_resurrects_after_restore(self, fake_sg: _FakeSG) -> None:
+    def test_disable_revokes_but_token_resurrects_after_restore(self, fake_sg: FakeSG) -> None:
         def rotate_only() -> None:
-            fake_sg._fail_rpc = True
+            fake_sg.fail_rpc = True
 
         def disable() -> None:
-            fake_sg._session_revoked = True
+            fake_sg.session_revoked = True
 
         def restore() -> None:
-            fake_sg._session_revoked = False
+            fake_sg.session_revoked = False
 
         io = _ScriptedIO([rotate_only, disable, restore])
         assert _run(fake_sg, io) == 3
-        out = io._text()
+        out = io.text()
         assert 'WORKS AGAIN after the script is restored' in out
         assert 'replacement' in out
 
-    def test_nothing_revokes(self, fake_sg: _FakeSG) -> None:
+    def test_nothing_revokes(self, fake_sg: FakeSG) -> None:
         def rotate_only() -> None:
-            fake_sg._fail_rpc = True
+            fake_sg.fail_rpc = True
 
         io = _ScriptedIO([rotate_only, lambda: None])
         assert _run(fake_sg, io) == _EXIT_NOT_REVOKED
-        assert 'survived BOTH' in io._text()
+        assert 'survived BOTH' in io.text()
 
-    def test_reports_rest_expiry(self, fake_sg: _FakeSG) -> None:
+    def test_reports_rest_expiry(self, fake_sg: FakeSG) -> None:
         def rotate() -> None:
-            fake_sg._fail_rpc = True
-            fake_sg._session_revoked = True
+            fake_sg.fail_rpc = True
+            fake_sg.session_revoked = True
 
         io = _ScriptedIO([rotate])
         _run(fake_sg, io)
-        assert '600' in io._text()
+        assert '600' in io.text()
 
-    def test_restore_instructions_survive_a_crash_after_disable(self, fake_sg: _FakeSG) -> None:
+    def test_restore_instructions_survive_a_crash_after_disable(self, fake_sg: FakeSG) -> None:
         def rotate_only() -> None:
-            fake_sg._fail_rpc = True
+            fake_sg.fail_rpc = True
 
         def break_site() -> None:
-            fake_sg._hard_fail = True
+            fake_sg.hard_fail = True
 
         io = _ScriptedIO([rotate_only, break_site])
         with pytest.raises(SGError):
             _run(fake_sg, io)
-        assert "Restore: the ApiUser 'broker_read_all'" in io._text()
+        assert "Restore: the ApiUser 'broker_read_all'" in io.text()
 
-    def test_rotation_revokes_token(self, fake_sg: _FakeSG) -> None:
+    def test_rotation_revokes_token(self, fake_sg: FakeSG) -> None:
         def rotate() -> None:
-            fake_sg._fail_rpc = True
-            fake_sg._session_revoked = True
+            fake_sg.fail_rpc = True
+            fake_sg.session_revoked = True
 
         io = _ScriptedIO([rotate])
         assert _run(fake_sg, io) == _EXIT_REVOKED
-        assert 'key rotation immediately revoked' in io._text()
+        assert 'key rotation immediately revoked' in io.text()
 
-    def test_step4_verifies_replacement_procedure(self, fake_sg: _FakeSG) -> None:
+    def test_step4_verifies_replacement_procedure(self, fake_sg: FakeSG) -> None:
         def rotate_only() -> None:
-            fake_sg._fail_rpc = True
+            fake_sg.fail_rpc = True
 
         def disable() -> None:
-            fake_sg._session_revoked = True
+            fake_sg.session_revoked = True
 
         def restore() -> None:
-            fake_sg._session_revoked = False
+            fake_sg.session_revoked = False
 
         def replace() -> None:
-            fake_sg._session_revoked = True
-            fake_sg._fail_rpc = False
+            fake_sg.session_revoked = True
+            fake_sg.fail_rpc = False
 
         io = _ScriptedIO(
             [rotate_only, disable, restore, replace],
@@ -129,17 +130,17 @@ class TestRunRevocationCheck:
             key_reply='new-replacement-key',
         )
         assert _run(fake_sg, io) == _EXIT_REVOKED
-        out = io._text()
+        out = io.text()
         assert 'dead while the renamed original stays trashed' in out
         assert 'replacement script mints under the original name' in out
 
-    def test_warns_if_old_key_still_mints(self, fake_sg: _FakeSG) -> None:
+    def test_warns_if_old_key_still_mints(self, fake_sg: FakeSG) -> None:
         def revoke_session_only() -> None:
-            fake_sg._session_revoked = True
+            fake_sg.session_revoked = True
 
         io = _ScriptedIO([revoke_session_only])
         assert _run(fake_sg, io) == _EXIT_REVOKED
-        assert 'warning: the old key still mints new tokens' in io._text()
+        assert 'warning: the old key still mints new tokens' in io.text()
 
 
 class TestSSLHint:
@@ -162,14 +163,14 @@ class TestSSLHint:
             run_revocation_check(SSLFailingMinter(), 's', 'k', io)
         assert str(raised.value).startswith('could not mint a session token:')
         assert 'corporate CA' in str(raised.value)
-        assert io._lines == []
+        assert io.lines == []
 
 
 class TestWalkthroughTranscript:
     def test_disable_that_stays_effective_after_restore(self) -> None:
         io = _ScriptedIO([])
         assert _run_scripted(_ScriptedMinter([True, True, False, False]), io) == _EXIT_REVOKED
-        assert io._lines == [
+        assert io.lines == [
             _MINTED,
             _REST_NOTE,
             _STEP_1,
@@ -189,7 +190,7 @@ class TestWalkthroughTranscript:
         io = _ScriptedIO([])
         minter = _ScriptedMinter([True, False], old_key_still_mints=True)
         assert _run_scripted(minter, io) == _EXIT_REVOKED
-        assert io._lines == [
+        assert io.lines == [
             _MINTED,
             _REST_NOTE,
             _STEP_1,
@@ -201,7 +202,7 @@ class TestWalkthroughTranscript:
     def test_skipped_replacement_is_unverified(self) -> None:
         io = _ScriptedIO([])
         assert _run_scripted(_ScriptedMinter([True, True, False, True]), io) == 3
-        assert io._lines == [
+        assert io.lines == [
             _MINTED,
             _REST_NOTE,
             _STEP_1,
@@ -222,7 +223,7 @@ class TestWalkthroughTranscript:
     def test_survival_advises_reassessing_app_session_tokens(self) -> None:
         io = _ScriptedIO([])
         assert _run_scripted(_ScriptedMinter([True, True, True]), io) == _EXIT_NOT_REVOKED
-        assert io._lines == [
+        assert io.lines == [
             _MINTED,
             _REST_NOTE,
             _STEP_1,
@@ -239,13 +240,13 @@ class TestWalkthroughTranscript:
         io = _ScriptedIO([])
         with pytest.raises(_verify.VerifySetupError, match='freshly minted session token'):
             _run_scripted(_ScriptedMinter([False]), io)
-        assert io._lines == []
+        assert io.lines == []
 
     def test_verified_replacement_names_the_full_procedure(self) -> None:
         io = _ScriptedIO([], replies=['', '', '', 'y'], key_reply='replacement-key')
         minter = _ScriptedMinter([True, True, False, True, False])
         assert _run_scripted(minter, io) == _EXIT_REVOKED
-        assert io._lines[-6:] == [
+        assert io.lines[-6:] == [
             _STEP_4,
             'Passed: the old token is dead while the renamed original stays trashed.',
             'application key for the replacement script (Enter to skip): ',
@@ -268,23 +269,23 @@ class _ScriptedIO:
         self._actions = list(actions)
         self._replies = list(replies or [])
         self._key_reply = key_reply
-        self._lines: list[str] = []
-
-    def _text(self) -> str:
-        return '\n'.join(self._lines)
+        self.lines: list[str] = []
 
     def ask(self, message: str) -> str:
-        self._lines.append(message)
+        self.lines.append(message)
         if self._actions:
             self._actions.pop(0)()
         return self._replies.pop(0) if self._replies else ''
 
     def ask_secret(self, message: str) -> str:
-        self._lines.append(message)
+        self.lines.append(message)
         return self._key_reply
 
     def say(self, message: str) -> None:
-        self._lines.append(message)
+        self.lines.append(message)
+
+    def text(self) -> str:
+        return '\n'.join(self.lines)
 
 
 class _ScriptedMinter:
@@ -313,8 +314,8 @@ class _ScriptedMinter:
         raise SGError('SG request to /api3/json returned HTTP 200: Authentication failed')
 
 
-def _run(fake_sg: _FakeSG, io: _ScriptedIO) -> int:
-    return run_revocation_check(SGMinter(fake_sg._url), 'broker_read_all', 'masterkey', io)
+def _run(fake_sg: FakeSG, io: _ScriptedIO) -> int:
+    return run_revocation_check(SGMinter(fake_sg.url), 'broker_read_all', 'masterkey', io)
 
 
 def _run_scripted(minter: _ScriptedMinter, io: _ScriptedIO) -> int:

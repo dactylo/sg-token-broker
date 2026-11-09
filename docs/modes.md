@@ -4,18 +4,17 @@ This page helps you decide which service and token type a tool needs, and shows 
 each one. If you have not run the broker yet, start with the
 [quick start](../README.md#quick-start).
 
-Two questions decide the choice: whose SG permissions the tool should use, and which SG API it
-calls.
+Choose in two steps: whose SG permissions the tool needs, then which API it calls.
 
 ## Whose permissions
 
-- **App tokens** run SG calls as a script account (an SG `ApiUser`). Use them for farm jobs,
-  background services, and tools that share one permission role. The app-token broker issues them.
-- **User tokens** run SG calls as the signed-in person's own account (an SG `HumanUser`). Use them
-  when SG must enforce that person's permissions and account status. The user-token service issues
-  them.
+| Use         | When the tool needs                                           | SG identity                    | Service            |
+| ----------- | ------------------------------------------------------------- | ------------------------------ | ------------------ |
+| App tokens  | A shared permission role for farm jobs or background services | Script account (`ApiUser`)     | App-token broker   |
+| User tokens | The signed-in person's permissions and account status         | Person's account (`HumanUser`) | User-token service |
 
-In both cases the long-lived script key stays inside the service; callers receive only tokens.
+In both cases the long-lived script key stays inside the service. An app-token caller holds a
+broker client credential instead, and a user-token caller signs in as the person.
 
 ## Which token type
 
@@ -30,21 +29,21 @@ as `session_token` to `shotgun_api3`.
 | User        | REST                      | User REST token    | [Cloud Run REST deployment](user-token-service.md#cloud-run-rest-deployment)                    |
 | User        | `shotgun_api3` / JSON-RPC | User session token | [Private session-token deployment](user-token-service.md#private-deployment-for-session-tokens) |
 
-REST tokens stop working at a hard expiry that SG sets. Session tokens follow SG's sliding
-inactivity window: active use keeps them alive, and they have no scheduled expiry. That difference
-shapes how you handle expiry and how you respond to a leak; see
-[token lifetime and revocation](sg-token-behavior.md).
+Prefer REST tokens when the tool does not need `shotgun_api3`: SG stops accepting them at a hard
+expiry. Session tokens use a sliding inactivity window, so active use can keep a leaked token alive
+indefinitely. See [token lifetime and revocation](sg-token-behavior.md) for expiry and recovery.
 
 ## App tokens
 
 A tool sends its broker client ID and secret with a scope name, such as `artist_read`. A *scope* is
 a name in the broker configuration that maps to one SG script account. The broker checks that the
-client may use the scope, then returns a token for that script account.
+client may use the scope and token type, then returns a token for that script account.
 
 The script account's SG permission role determines what the tool can do; the scope name itself
 enforces nothing. Keep scopes narrow, such as `farm_render_read` or `publish_tool_write`, and give
 each consuming system its own broker credential. Anyone holding a client credential can request
-every scope that client is allowed.
+every scope and token type that client is allowed. If a client's tools do not use `shotgun_api3`,
+limit it to REST tokens with [`token_types`](deployment.md#configuration-reference).
 
 An application may record who launched it, but SG attributes its requests to the script account.
 Choose user tokens when SG itself needs the person's identity.
@@ -63,7 +62,8 @@ sg = shotgun_api3.Shotgun(token.site_url, session_token=token.token)
 
 For REST, call `fetch_token('artist_read', 'rest')` and send the token to SG in an
 `Authorization: Bearer` header. The broker never gives callers the script key or an SG refresh
-token.
+token. If SG rejects a token before its `expires_at`, see
+[replacing a rejected app token](sg-token-behavior.md#replacing-a-rejected-app-token).
 
 ## User tokens
 
@@ -74,12 +74,13 @@ service cannot reduce it to read-only. Restrict access through the person's SG p
 
 Choose the deployment that matches the token type:
 
-- **REST:** the Cloud Run deployment serves Google Workspace callers behind Cloud Run IAM and is
-  configured with `SGUT_TOKEN_TYPES=rest`.
-- **Session:** deploy on a restricted network with its own *sudo-capable* script account (one that
-  SG allows to act as other users), `SGUT_TOKEN_TYPES=session`, and a Google or OIDC provider. Do
-  not issue session tokens from an internet-facing deployment: a session token has no hard expiry,
-  so a leaked one stays usable for as long as someone keeps using it.
+| Token type | Deployment boundary        | Identity provider        | Setting                    |
+| ---------- | -------------------------- | ------------------------ | -------------------------- |
+| REST       | Cloud Run IAM              | Google Workspace         | `SGUT_TOKEN_TYPES=rest`    |
+| Session    | Restricted private network | Google Workspace or OIDC | `SGUT_TOKEN_TYPES=session` |
+
+Each deployment needs its own *sudo-capable* script account: one SG allows to act as other users.
+Do not issue session tokens from an internet-facing deployment, because they have no hard expiry.
 
 For desktop tools, follow [desktop client setup](user-token-service.md#desktop-client-setup). An
 application with this package and `shotgun_api3` installed can then use:
@@ -103,7 +104,10 @@ Disabling the person's SG account suspends their tokens. Before offboarding some
 
 ## Desktop and web integration
 
-App-token tools fetch tokens in the background with a provisioned client credential.
+App-token tools are unattended processes on hosts you control, and they fetch tokens with a
+provisioned client credential. Do not give a client credential to tools that people run on their
+own workstations: anyone who can use the workstation can read it and act as the script account, and
+SG cannot tell those people apart. Give such tools user tokens instead.
 
 Desktop tools that need user tokens sign the person in through the system browser, using the OAuth
 authorization code flow with PKCE and a temporary loopback callback. With the optional `login`

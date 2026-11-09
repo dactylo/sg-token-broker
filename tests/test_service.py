@@ -10,7 +10,7 @@ import pytest
 from sg_token_broker import _service
 from sg_token_broker._audit import AuditLogger
 from sg_token_broker._cache import TTLCache
-from sg_token_broker._config import BrokerConfig, ClientConfig, ScopeConfig, load_config
+from sg_token_broker._config import BrokerConfig, ScopeConfig, _ClientConfig, load_config
 from sg_token_broker._secrets import token_fingerprint
 from sg_token_broker._service import (
     _REST_TYPE,
@@ -19,29 +19,24 @@ from sg_token_broker._service import (
     BrokerError,
     BrokerService,
     InvalidClientError,
-    IssuedToken,
     TokenRequest,
     _ForbiddenError,
+    _IssuedToken,
     _RateLimitedError,
     _UpstreamError,
 )
 from sg_token_broker._sg import MintedToken, SGError
+from tests.conftest import BROKER_CREDENTIAL, BROKER_HASH
 
-AUDIT_INVALID = 'invalid'
-FARM_CREDENTIAL = 'farm-credential'
-# Precomputed hash of FARM_CREDENTIAL; authentication still uses the real KDF.
-_FARM_HASH = (
-    'scrypt$16384$8$1$tcz9OTN0w9hLf2Zh12rdKQ==$'
-    'awBt8momr/VzxYTd7/N+PmovkQUbLjh48W5GCf/2yUlprwvi/nWejmNmwCWgsPo5wy/dsyY/b6t/DCDF6l1C3Q=='
-)
-MASTER = 'masterkey'
-SCRIPT = 'broker_read_all'
-WEIRD_TYPE = 'weird'
+_AUDIT_INVALID = 'invalid'
+_MASTER = 'masterkey'
+_SCRIPT = 'broker_read_all'
+_WEIRD_TYPE = 'weird'
 
 
 class TestIssueToken:
     def test_bad_secret_rejected(self, config: BrokerConfig) -> None:
-        wrong = FARM_CREDENTIAL[:-1]
+        wrong = BROKER_CREDENTIAL[:-1]
         with pytest.raises(InvalidClientError):
             _make_service(config, _FakeMinter()).issue_token(_request(client_secret=wrong))
 
@@ -78,11 +73,12 @@ class TestIssueToken:
             scopes=frozenset({'read_all', 'write_notes'}),
             rate_limit_per_minute=20,
         )
-        desktop = ClientConfig(
+        desktop = _ClientConfig(
             client_id='desktop',
-            secret_hash=_FARM_HASH,
+            secret_hash=BROKER_HASH,
             scopes=frozenset({'read_all'}),
             rate_limit_per_minute=20,
+            token_types=frozenset({_SESSION_TYPE, _REST_TYPE}),
         )
         expanded = replace(
             config,
@@ -91,19 +87,19 @@ class TestIssueToken:
         )
 
         class DistinguishableMinter(_FakeMinter):
-            _rest_calls: int
-            _session_calls: int
+            rest_calls: int
+            session_calls: int
 
             def mint_rest_token(self, script_name: str, script_key: str) -> MintedToken:
                 del script_key
-                self._rest_calls += 1
-                return MintedToken(token=f'rest-{self._rest_calls}-{script_name}', expires_in=600)
+                self.rest_calls += 1
+                return MintedToken(token=f'rest-{self.rest_calls}-{script_name}', expires_in=600)
 
             def mint_session_token(self, script_name: str, script_key: str) -> MintedToken:
                 del script_key
-                self._session_calls += 1
+                self.session_calls += 1
                 return MintedToken(
-                    token=f'session-{self._session_calls}-{script_name}',
+                    token=f'session-{self.session_calls}-{script_name}',
                     expires_in=None,
                 )
 
@@ -117,7 +113,7 @@ class TestIssueToken:
 
         assert farm_read.token == farm_read_again.token
         assert len({farm_read.token, desktop_read.token, farm_write.token, farm_rest.token}) == 4
-        assert (minter._session_calls, minter._rest_calls) == (3, 1)
+        assert (minter.session_calls, minter.rest_calls) == (3, 1)
 
     def test_caller_fault_audit_has_no_detail(
         self, config: BrokerConfig, caplog: pytest.LogCaptureFixture
@@ -140,12 +136,12 @@ class TestIssueToken:
 
     def test_issues_rest_token(self, config: BrokerConfig) -> None:
         issued = _make_service(config, _FakeMinter()).issue_token(_request(token_type=_REST_TYPE))
-        assert issued.token == f'rest-{SCRIPT}-{MASTER}'
+        assert issued.token == f'rest-{_SCRIPT}-{_MASTER}'
 
     def test_issues_session_token(self, config: BrokerConfig) -> None:
         minter = _FakeMinter()
         issued = _make_service(config, minter).issue_token(_request())
-        assert issued.token == f'sess-{SCRIPT}-{MASTER}'
+        assert issued.token == f'sess-{_SCRIPT}-{_MASTER}'
         assert issued.token_type == _SESSION_TYPE
         assert issued.scope == 'read_all'
         assert issued.site_url == 'https://studio.shotgunstudio.com'
@@ -162,14 +158,14 @@ class TestIssueToken:
         now = [0.0]
         limiter = _service._RateLimiter(lambda: now[0])
 
-        assert limiter._check('a', 2)
-        assert limiter._check('a', 2)
-        assert not limiter._check('a', 2)
-        assert limiter._check('b', 2)
+        assert limiter.check('a', 2)
+        assert limiter.check('a', 2)
+        assert not limiter.check('a', 2)
+        assert limiter.check('b', 2)
         now[0] = 59.999
-        assert not limiter._check('a', 2)
+        assert not limiter.check('a', 2)
         now[0] = 60.0
-        assert limiter._check('a', 2)
+        assert limiter.check('a', 2)
 
     def test_rest_cache_never_outlives_token(
         self,
@@ -177,7 +173,7 @@ class TestIssueToken:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         minter = _FakeMinter()
-        minter._rest_expires_in = 90
+        minter.rest_expires_in = 90
         service = _make_service(config, minter)
         base = datetime.datetime(2026, 8, 10, 12, 0, tzinfo=datetime.UTC)
         now = [base]
@@ -189,11 +185,29 @@ class TestIssueToken:
 
         assert first.expires_at == base + datetime.timedelta(seconds=30)
         assert second.expires_at == now[0] + datetime.timedelta(seconds=30)
-        assert minter._rest_calls == 2
+        assert minter.rest_calls == 2
 
     def test_scope_not_allowed_rejected(self, config: BrokerConfig) -> None:
         with pytest.raises(_ForbiddenError):
             _make_service(config, _FakeMinter()).issue_token(_request(scope='write_production'))
+
+    def test_token_type_not_allowed_for_client_rejected(
+        self, config: BrokerConfig, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        rest_only = replace(config.clients['farm'], token_types=frozenset({_REST_TYPE}))
+        minter = _FakeMinter()
+        service = _make_service(
+            replace(config, clients=MappingProxyType({'farm': rest_only})), minter
+        )
+        with (
+            caplog.at_level(logging.INFO, logger='svc-test'),
+            pytest.raises(_ForbiddenError, match='token_type'),
+        ):
+            service.issue_token(_request())
+        record = json.loads(caplog.records[-1].getMessage())
+        assert (record['reason'], record['token_type']) == ('forbidden', _SESSION_TYPE)
+        assert minter.session_calls == 0
+        assert service.issue_token(_request(token_type=_REST_TYPE)).token_type == _REST_TYPE
 
     def test_unknown_client_id_is_bounded_in_audit(
         self, config: BrokerConfig, caplog: pytest.LogCaptureFixture
@@ -204,13 +218,13 @@ class TestIssueToken:
             pytest.raises(InvalidClientError),
         ):
             _make_service(config, _FakeMinter()).issue_token(
-                _request(client_id=huge, scope='not-a-scope', token_type=WEIRD_TYPE)
+                _request(client_id=huge, scope='not-a-scope', token_type=_WEIRD_TYPE)
             )
         record = json.loads(caplog.records[-1].getMessage())
         assert len(record['client_id']) == 64
         assert record['client_id_truncated'] is True
-        assert record['scope'] == AUDIT_INVALID
-        assert record['token_type'] == AUDIT_INVALID
+        assert record['scope'] == _AUDIT_INVALID
+        assert record['token_type'] == _AUDIT_INVALID
         assert len(caplog.records[-1].getMessage()) < 512
 
     def test_unknown_client_rejected(
@@ -237,16 +251,18 @@ class TestIssueToken:
             service.issue_token(_request())
         assert excinfo.value.status == 500
         assert excinfo.value.error == 'internal_error'
+        assert str(excinfo.value) == 'internal error'
         assert 'SGTB_KEY_READ_ALL' not in str(excinfo.value)
         record = json.loads(caplog.records[-1].getMessage())
         assert record['event'] == 'error'
         assert record['reason'] == 'internal_error'
+        assert record['detail'] == 'environment variable SGTB_KEY_READ_ALL is not set or empty'
 
     def test_upstream_error_audit_carries_the_cause(
         self, config: BrokerConfig, caplog: pytest.LogCaptureFixture
     ) -> None:
         minter = _FakeMinter()
-        minter._fail = True
+        minter.fail = True
         with caplog.at_level(logging.INFO, logger='svc-test'), pytest.raises(_UpstreamError):
             _make_service(config, minter).issue_token(_request())
         record = json.loads(caplog.records[-1].getMessage())
@@ -257,7 +273,7 @@ class TestIssueToken:
 class TestSecretRepr:
     def test_issued_token_repr_hides_the_token(self) -> None:
         value = 'secret-token-value'
-        issued = IssuedToken(
+        issued = _IssuedToken(
             token=value,
             token_type=_SESSION_TYPE,
             scope='read_all',
@@ -269,26 +285,26 @@ class TestSecretRepr:
 
     def test_token_request_repr_hides_the_client_secret(self) -> None:
         token_request = _request()
-        assert FARM_CREDENTIAL not in repr(token_request)
-        assert FARM_CREDENTIAL not in str(token_request)
+        assert BROKER_CREDENTIAL not in repr(token_request)
+        assert BROKER_CREDENTIAL not in str(token_request)
 
 
 class _FakeMinter:
     def __init__(self) -> None:
-        self._session_calls = 0
-        self._rest_calls = 0
-        self._rest_expires_in = 600
-        self._fail = False
+        self.session_calls = 0
+        self.rest_calls = 0
+        self.rest_expires_in = 600
+        self.fail = False
 
     def mint_rest_token(self, script_name: str, script_key: str) -> MintedToken:
-        self._rest_calls += 1
+        self.rest_calls += 1
         return MintedToken(
-            token=f'rest-{script_name}-{script_key}', expires_in=self._rest_expires_in
+            token=f'rest-{script_name}-{script_key}', expires_in=self.rest_expires_in
         )
 
     def mint_session_token(self, script_name: str, script_key: str) -> MintedToken:
-        self._session_calls += 1
-        if self._fail:
+        self.session_calls += 1
+        if self.fail:
             raise SGError('upstream down')
         return MintedToken(token=f'sess-{script_name}-{script_key}', expires_in=None)
 
@@ -296,7 +312,7 @@ class _FakeMinter:
 def _request(**overrides: str) -> TokenRequest:
     base: dict[str, str] = {
         'client_id': 'farm',
-        'client_secret': FARM_CREDENTIAL,
+        'client_secret': BROKER_CREDENTIAL,
         'scope': 'read_all',
         'token_type': 'session',
         'source_ip': '10.0.0.9',
@@ -307,7 +323,7 @@ def _request(**overrides: str) -> TokenRequest:
 
 @pytest.fixture
 def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> BrokerConfig:
-    monkeypatch.setenv('SGTB_KEY_READ_ALL', MASTER)
+    monkeypatch.setenv('SGTB_KEY_READ_ALL', _MASTER)
     path = tmp_path / 'broker.yml'
     path.write_text(f"""
 site_url: https://studio.shotgunstudio.com
@@ -320,7 +336,7 @@ scopes:
     script_key_env: SGTB_KEY_READ_ALL
 clients:
   farm:
-    secret_hash: "{_FARM_HASH}"
+    secret_hash: "{BROKER_HASH}"
     scopes: [read_all]
 """)
     return load_config(path)

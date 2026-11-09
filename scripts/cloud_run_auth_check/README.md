@@ -1,11 +1,17 @@
 # Cloud Run authentication check
 
-This check service tests Apps Script identity tokens and Cloud Run invoker authorization before
-deploying the user-token service. Follow the public
-[Cloud Run authentication check](../../docs/user-token-service.md#cloud-run-authentication-check)
-for deployment steps and acceptance criteria.
+Use this helper before deploying the user-token service to check that Cloud Run accepts Apps Script
+identity tokens and allows only your invoker group. It needs no SG key. Follow the
+[deployment steps and expected results](../../docs/user-token-service.md#cloud-run-authentication-check).
 
-From a test Sheet, use [`appsscript/appsscript.json`](appsscript/appsscript.json) for the required
-scopes and [`appsscript/Code.gs`](appsscript/Code.gs) to log the identity-token audience and call
-the check service. The service source is [`main.py`](main.py), with [`Procfile`](Procfile) for
-startup.
+The helper echoes identity claims and relies on Cloud Run IAM to verify the caller. Deploy it with
+`--no-allow-unauthenticated`; it does not verify token signatures itself.
+
+For the test Sheet, use these files:
+
+| File                                                       | Purpose                                           |
+| ---------------------------------------------------------- | ------------------------------------------------- |
+| [`appsscript/appsscript.json`](appsscript/appsscript.json) | Required identity-token and request scopes        |
+| [`appsscript/Code.gs`](appsscript/Code.gs)                 | Log the token audience and call the check service |
+| [`main.py`](main.py)                                       | Check-service HTTP handler                        |
+| [`Procfile`](Procfile)                                     | Service startup command                           |

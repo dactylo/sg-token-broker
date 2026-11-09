@@ -40,6 +40,7 @@ from sg_token_broker._userauth import (
     SignInError,
     SignInSettingsError,
     account_from_id_token,
+    configured_client_secret,
     credential_namespace,
     identity_settings,
     sign_in,
@@ -103,6 +104,10 @@ class _ConsoleIO:
 
         Returns:
             The entered line.
+
+        Raises:
+            EOFError: If input ends before a line is entered.
+            OSError: If the prompt or input cannot be read or written.
         """
         return input(message)
 
@@ -114,6 +119,10 @@ class _ConsoleIO:
 
         Returns:
             The entered value.
+
+        Raises:
+            EOFError: If input ends before a value is entered.
+            OSError: If terminal input or output fails.
         """
         return getpass.getpass(message)
 
@@ -122,6 +131,9 @@ class _ConsoleIO:
 
         Args:
             message: Output text.
+
+        Raises:
+            OSError: If the output cannot be written.
         """
         print(message)
 
@@ -130,7 +142,12 @@ class _RootParser(argparse.ArgumentParser):
     """Render options first and top-level commands under titled groups."""
 
     def format_help(self, formatter: argparse.HelpFormatter | None = None) -> str:
-        """Return help with options first and commands in titled groups."""
+        """Return help with options first and commands in titled groups.
+
+        Args:
+            formatter: Formatter to populate with this parser's help sections,
+                or `None` to create a formatter from the parser configuration.
+        """
         if formatter is None:
             formatter = self._get_formatter()
         formatter.add_usage(self.usage, self._actions, self._mutually_exclusive_groups)
@@ -176,6 +193,19 @@ def _print_version() -> int:
         return 2
     print(f'sg-token-broker {version}')
     return 0
+
+
+def _readable_ca_bundle(value: str) -> str:
+    """Require a readable CA bundle file before sending any requests."""
+    path = Path(value)
+    try:
+        if not path.is_file():
+            raise argparse.ArgumentTypeError(f'no readable CA bundle at {value}')
+        with path.open('rb'):
+            pass
+    except OSError as exc:
+        raise argparse.ArgumentTypeError(f'no readable CA bundle at {value}') from exc
+    return value
 
 
 def _report_error(message: str) -> None:
@@ -243,11 +273,27 @@ def _cmd_get_user_token(args: argparse.Namespace) -> int:
 
 def _cmd_hash_secret(args: argparse.Namespace) -> int:
     """Generate (or hash a provided) client secret."""
-    secret = generate_secret() if args.secret is None else args.secret
+    if args.secret:
+        if sys.stdin.isatty():
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter('error', getpass.GetPassWarning)
+                    secret = getpass.getpass('secret: ')
+            except getpass.GetPassWarning:
+                _report_error(
+                    'cannot hide the secret on this terminal; pipe it on standard input instead'
+                )
+                return 2
+        else:
+            secret = sys.stdin.readline()
+        secret = secret.removesuffix('\n').removesuffix('\r')
+    else:
+        secret = generate_secret()
     if not is_credential_text(secret):
         _report_error('secret must be non-empty printable ASCII with no spaces')
         return 2
-    print(f'secret: {secret}')
+    if not args.secret:
+        print(f'secret: {secret}')
     print(f'hash: {hash_secret(secret)}')
     return 0
 
@@ -255,11 +301,12 @@ def _cmd_hash_secret(args: argparse.Namespace) -> int:
 def _cmd_login(args: argparse.Namespace) -> int:
     """Interactively sign in; optionally store the refresh credential."""
     try:
-        client_id, issuer_key, auth_endpoint, token_endpoint = identity_settings()
+        issuer_key, client_id, auth_endpoint, token_endpoint = identity_settings()
         bundle = sign_in(
             client_id,
             authorization_endpoint=auth_endpoint,
             token_endpoint=token_endpoint,
+            client_secret=configured_client_secret(),
             request_offline_access=not args.no_store,
         )
         account = account_from_id_token(bundle.id_token)
@@ -278,7 +325,17 @@ def _cmd_login(args: argparse.Namespace) -> int:
                 f'to use the stored credential',
                 file=sys.stderr,
             )
-    print(f'signed in as {account}' + ('' if stored else ' (credential not stored)'))
+    if stored:
+        suffix = ''
+    elif args.no_store:
+        suffix = ' (credential not stored)'
+    elif bundle.refresh_token is None:
+        suffix = ' (credential not stored: the provider issued no refresh credential)'
+    else:
+        suffix = (
+            ' (credential not stored: install sg-token-broker[login] or use a supported keyring)'
+        )
+    print(f'signed in as {account}{suffix}')
     return 0
 
 
@@ -286,7 +343,7 @@ def _cmd_logout(args: argparse.Namespace) -> int:
     """Remove the stored refresh credential and account pointer."""
     del args
     try:
-        client_id, issuer_key = credential_namespace()
+        issuer_key, client_id = credential_namespace()
     except SignInSettingsError as exc:
         _report_error(str(exc))
         return 2
@@ -355,10 +412,10 @@ def _cmd_serve_user_tokens(args: argparse.Namespace) -> int:
         token_types=config.token_types,
         session_ttl_seconds=config.session_ttl_seconds,
     )
-    # '' binds all interfaces, which Cloud Run requires.
+    # The default '' binds all interfaces, which Cloud Run requires.
     try:
         server = create_user_token_server(
-            '', config.port, service, trusted_proxies=config.trusted_proxies
+            config.bind, config.port, service, trusted_proxies=config.trusted_proxies
         )
     except OSError as exc:
         _report_error(
@@ -533,12 +590,17 @@ def _build_parser() -> argparse.ArgumentParser:
     hash_cmd = commands.add_parser(
         'hash-secret',
         help=_COMMAND_HELP['hash-secret'],
-        description='Print a new client secret and its hash, or the hash of a given secret.',
+        description=(
+            'Print a new client secret and its hash, or only the hash of a secret you enter.'
+        ),
     )
     hash_cmd.add_argument(
         '--secret',
-        metavar='SECRET',
-        help='hash this printable-ASCII secret instead of generating one',
+        action='store_true',
+        help=(
+            'hash a secret read from a no-echo prompt, or from standard input when it is not a '
+            'terminal'
+        ),
     )
     hash_cmd.set_defaults(func=_cmd_hash_secret)
 
@@ -651,11 +713,12 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_connection.add_argument(
         '--proxy',
         metavar='URL',
-        help='HTTP(S) proxy URL, e.g. http://squid:8080 '
+        help='HTTP(S) proxy URL, e.g. http://proxy.example:3128 '
         '(HTTP_PROXY/HTTPS_PROXY env vars are honored without this flag)',
     )
     verify_connection.add_argument(
         '--ca-bundle',
+        type=_readable_ca_bundle,
         metavar='FILE',
         help='CA bundle file for TLS verification, e.g. the corporate root CA when the '
         'proxy intercepts TLS (REQUESTS_CA_BUNDLE env var is honored without this flag)',
@@ -694,10 +757,16 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     Returns:
         The command's exit status, 2 if standard output is unavailable, or
-        130 if an uncaught keyboard interrupt stops the command.
+        130 if a keyboard interrupt stops command execution.
 
     Raises:
         SystemExit: With status 0 for help or 2 for invalid arguments.
+        EOFError: If an interactive prompt reaches end-of-input.
+        OSError: If command input, output, callback listener setup, or stdout
+            cleanup fails for a reason other than an absorbed downstream
+            closure.
+        RuntimeError: If an interactive sign-in callback thread cannot be
+            started.
     """
     if sys.stdout is None:
         # Started with standard output closed: nothing can be delivered, and the
