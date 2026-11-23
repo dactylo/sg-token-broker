@@ -4,22 +4,27 @@ import argparse
 import getpass
 import importlib.metadata
 import json
-import logging
 import math
 import os
 import re
+import signal
 import ssl
 import sys
 import warnings
 from collections.abc import Iterable
 from pathlib import Path
+from typing import NoReturn, TextIO
 
 import requests
 import urllib3
 
 from sg_token_broker._audit import AuditLogger
-from sg_token_broker._cache import TTLCache
-from sg_token_broker._client import BrokerClient, BrokerClientError, ClientOptions
+from sg_token_broker._client import (
+    BrokerClientError,
+    ClientOptions,
+    KeyAcquirer,
+    resolve_client_settings,
+)
 from sg_token_broker._config import BrokerConfig, ConfigError, is_credential_text, load_config
 from sg_token_broker._credstore import (
     delete_account,
@@ -28,13 +33,20 @@ from sg_token_broker._credstore import (
     store_account,
     store_refresh_token,
 )
-from sg_token_broker._downstream import closable_stdout
+from sg_token_broker._downstream import closable_stdout, discard_closed_output
 from sg_token_broker._gclaims import ClaimsValidator, OidcClaimsValidator
 from sg_token_broker._googleverify import VerifierUnavailableError, google_auth_verifier
 from sg_token_broker._http import create_server
+from sg_token_broker._httpbase import BoundedThreadingHTTPServer
 from sg_token_broker._oidcverify import OidcUnavailableError, oidc_verifier
+from sg_token_broker._retry import (
+    DEFAULT_MAX_WAIT_SECONDS,
+    DEFAULT_RETRIES,
+    DEFAULT_TIMEOUT_SECONDS,
+)
 from sg_token_broker._secrets import SecretError, generate_secret, hash_secret, resolve_script_key
 from sg_token_broker._service import BrokerService
+from sg_token_broker._servicelog import ServiceWriter, service_logging, service_streams
 from sg_token_broker._sg import SGError, SGMinter
 from sg_token_broker._userauth import (
     SignInError,
@@ -54,6 +66,7 @@ from sg_token_broker._userconfig import UserConfigError, load_user_token_config
 from sg_token_broker._userhttp import create_user_token_server
 from sg_token_broker._users import UserDirectory
 from sg_token_broker._usertoken import ClaimsPolicy, ServiceAccount, UserTokenService
+from sg_token_broker._vendor.strictargs import StrictParser
 from sg_token_broker._verify import EXIT_SETUP_ERROR, VerifySetupError, run_revocation_check
 
 _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
@@ -91,6 +104,18 @@ _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
 _COMMAND_HELP = {name: text for _title, commands in _COMMAND_GROUPS for name, text in commands}
 
 _CONTROL_CHARACTERS = re.compile(r'[\x00-\x1f\x7f-\x9f]')
+_MAX_REJECTED_TOKENS = 8
+_REJECTED_ARGUMENT_ERROR = (
+    '--replace-rejected reads rejected tokens from standard input, one per line; '
+    'do not pass tokens as arguments'
+)
+_REPLACEMENT_OPTION_ERRORS = {
+    'argument --max-wait': '--max-wait must be a finite number of seconds greater than zero',
+    'argument --retries': '--retries must be an integer greater than or equal to zero',
+    'argument --scope': '--scope requires a scope name',
+    'argument --timeout': '--timeout must be a finite number of seconds greater than zero',
+    'argument --token-type': 'choose session or rest for --token-type',
+}
 
 
 class _ConsoleIO:
@@ -138,7 +163,27 @@ class _ConsoleIO:
         print(message)
 
 
-class _RootParser(argparse.ArgumentParser):
+class _ReplacementParser(StrictParser):
+    """Render usage errors for replacement calls without exposing argument values."""
+
+    def error(self, message: str) -> NoReturn:
+        """Exit with status 2 and instructions for supplying rejected tokens.
+
+        Args:
+            message: Argparse diagnostic, which may include credentials.
+
+        Raises:
+            SystemExit: On every usage error.
+        """
+        # Render only known instructions, never argparse's interpolated input.
+        option = message.partition(': ')[0]
+        fix = _REPLACEMENT_OPTION_ERRORS.get(option)
+        if message == 'the following arguments are required: --scope':
+            fix = message
+        super().error(f'{fix}. {_REJECTED_ARGUMENT_ERROR}' if fix else _REJECTED_ARGUMENT_ERROR)
+
+
+class _RootParser(StrictParser):
     """Render options first and top-level commands under titled groups."""
 
     def format_help(self, formatter: argparse.HelpFormatter | None = None) -> str:
@@ -165,6 +210,15 @@ class _RootParser(argparse.ArgumentParser):
         return formatter.format_help()
 
 
+class _ReplacementRootParser(_ReplacementParser, _RootParser):
+    """Show grouped root help and redact replacement-mode usage errors."""
+
+
+def _exit_on_stop(signum: int, _frame: object) -> NoReturn:
+    """Exit immediately, including as PID 1, without waiting for workers or log writers."""
+    os._exit(128 + signum)
+
+
 def _non_negative_int(value: str) -> int:
     """Argparse type: a non-negative integer."""
     number = int(value)
@@ -175,9 +229,13 @@ def _non_negative_int(value: str) -> int:
 
 def _positive_finite_float(value: str) -> float:
     """Parse a finite floating-point value greater than zero."""
-    number = float(value)
+    message = 'must be a finite floating-point value greater than zero'
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(message) from exc
     if not (math.isfinite(number) and number > 0):
-        raise argparse.ArgumentTypeError('must be a finite floating-point value greater than zero')
+        raise argparse.ArgumentTypeError(message)
     return number
 
 
@@ -195,6 +253,26 @@ def _print_version() -> int:
     return 0
 
 
+def _read_rejected_tokens() -> list[str]:
+    """Read up to eight opaque token values from piped standard input."""
+    if sys.stdin is None or sys.stdin.isatty():
+        raise ValueError(
+            'pipe rejected tokens on standard input, one per line, for example: '
+            'sg-token-broker get-token --scope SCOPE --replace-rejected < rejected-tokens.txt'
+        )
+    rejected: list[str] = []
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        if len(rejected) == _MAX_REJECTED_TOKENS:
+            raise ValueError(
+                f'pass at most {_MAX_REJECTED_TOKENS} rejected tokens on standard input; '
+                'keep the most recent distinct tokens'
+            )
+        rejected.append(line.rstrip('\r\n'))
+    return rejected
+
+
 def _readable_ca_bundle(value: str) -> str:
     """Require a readable CA bundle file before sending any requests."""
     path = Path(value)
@@ -208,24 +286,33 @@ def _readable_ca_bundle(value: str) -> str:
     return value
 
 
-def _report_error(message: str) -> None:
+def _report_error(
+    message: str, *, redact: Iterable[str] = (), stream: TextIO | None = None
+) -> None:
     """Print one terminal-safe error line to standard error."""
+    for value in sorted(redact, key=len, reverse=True):
+        message = message.replace(value, '[redacted]')
     visible = _CONTROL_CHARACTERS.sub(lambda match: f'\\x{ord(match.group()):02x}', message)
-    print(f'error: {visible}', file=sys.stderr)
+    print(f'error: {visible}', file=stream if stream is not None else sys.stderr)
 
 
 def _cmd_get_token(args: argparse.Namespace) -> int:
     """Fetch a token from the broker and print it as JSON."""
-    options = ClientOptions(timeout=args.timeout, retries=args.retries)
+    options = ClientOptions(timeout=args.timeout, retries=args.retries, max_wait=args.max_wait)
+    rejected: list[str] = []
     try:
-        client = BrokerClient(options=options)
-    except BrokerClientError as exc:
-        _report_error(str(exc))
+        if args.replace_rejected:
+            rejected = _read_rejected_tokens()
+        settings = resolve_client_settings(None, None, None)
+    except (ValueError, BrokerClientError) as exc:
+        _report_error(str(exc), redact=rejected)
         return 2
     try:
-        token = client.fetch_token(args.scope, args.token_type)
+        with requests.Session() as session:
+            client = KeyAcquirer(settings=settings, options=options, session=session)
+            token = client.fetch(args.scope, args.token_type, rejected_tokens=rejected)
     except BrokerClientError as exc:
-        _report_error(str(exc))
+        _report_error(str(exc), redact=rejected)
         return 1
     print(
         json.dumps(
@@ -244,7 +331,9 @@ def _cmd_get_token(args: argparse.Namespace) -> int:
 def _cmd_get_user_token(args: argparse.Namespace) -> int:
     """Fetch a user token via the library's default sign-in flow."""
     try:
-        client = UserTokenClient()
+        client = UserTokenClient(
+            timeout=args.timeout, retries=args.retries, max_wait=args.max_wait
+        )
     except UserTokenSettingsError as exc:
         _report_error(str(exc))
         return 2
@@ -306,6 +395,7 @@ def _cmd_login(args: argparse.Namespace) -> int:
             client_id,
             authorization_endpoint=auth_endpoint,
             token_endpoint=token_endpoint,
+            issuer=issuer_key,
             client_secret=configured_client_secret(),
             request_offline_access=not args.no_store,
         )
@@ -362,76 +452,6 @@ def _cmd_logout(args: argparse.Namespace) -> int:
         _report_error('credential removed, but account pointer remains')
         return 1
     print(f'signed out {account}')
-    return 0
-
-
-def _cmd_serve_user_tokens(args: argparse.Namespace) -> int:
-    """Run the user-token service until interrupted."""
-    del args
-    logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)
-    try:
-        config = load_user_token_config(os.environ)
-    except UserConfigError as exc:
-        _report_error(str(exc))
-        return 2
-    claims: ClaimsPolicy
-    if config.provider == 'oidc':
-        issuer = config.issuer
-        if issuer is None:  # enforced by load_user_token_config
-            raise RuntimeError('OIDC provider has no issuer')
-        try:
-            verifier = oidc_verifier(issuer, config.oidc_algorithms)
-        except OidcUnavailableError as exc:
-            _report_error(str(exc))
-            return 2
-        except (ValueError, requests.RequestException) as exc:
-            _report_error(f'cannot verify identity tokens: {exc}')
-            return 1
-        claims = OidcClaimsValidator(
-            verifier,
-            config.audiences,
-            config.allowed_domain,
-            email_claim=config.email_claim,
-            assume_email_verified=config.assume_email_verified,
-        )
-    else:
-        try:
-            claims = ClaimsValidator(
-                google_auth_verifier(), config.audiences, config.allowed_domain
-            )
-        except VerifierUnavailableError as exc:
-            _report_error(str(exc))
-            return 2
-    minter = SGMinter(config.site_url)
-    service = UserTokenService(
-        ServiceAccount(config.site_url, config.script_name, config.script_key),
-        claims,
-        UserDirectory(config.site_url, minter, config.script_name, config.script_key),
-        minter,
-        AuditLogger(),
-        token_types=config.token_types,
-        session_ttl_seconds=config.session_ttl_seconds,
-    )
-    # The default '' binds all interfaces, which Cloud Run requires.
-    try:
-        server = create_user_token_server(
-            config.bind, config.port, service, trusted_proxies=config.trusted_proxies
-        )
-    except OSError as exc:
-        _report_error(
-            f'cannot start the user-token service on port {config.port}: {exc.strerror or exc}'
-        )
-        return 1
-    print(f'serving user tokens on port {server.server_address[1]}', file=sys.stderr)
-    # Cloud Run stops instances with SIGTERM (default disposition: abrupt exit,
-    # skipping the finally). Accepted: the service is stateless, handlers are
-    # sub-second, and Cloud Run drains routing before the signal.
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
     return 0
 
 
@@ -498,43 +518,13 @@ def _cmd_check_config(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_serve(args: argparse.Namespace) -> int:
-    """Run the broker service until interrupted."""
-    logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stderr)
+def _serve(
+    server: BoundedThreadingHTTPServer, writer: ServiceWriter, stderr: TextIO, startup: str
+) -> int:
+    """Announce readiness and run the HTTP server until stopped."""
+    server.logger = writer
     try:
-        config = load_config(Path(args.config))
-    except ConfigError as exc:
-        _report_error(str(exc))
-        return 2
-    key_errors = _resolve_config_keys(config)
-    if key_errors:
-        _report_error('; '.join(key_errors))
-        return 2
-    service = BrokerService(
-        config=config,
-        minter=SGMinter(config.site_url),
-        cache=TTLCache(),
-        audit=AuditLogger(),
-    )
-    try:
-        server = create_server(config, service)
-    except ssl.SSLError as exc:
-        _report_error(f'cannot load the TLS certificate and key: {exc}')
-        return 2
-    except OSError as exc:
-        _report_error(
-            f'cannot start the broker on port {config.server.port}: {exc.strerror or exc}'
-        )
-        return 1
-    scheme = 'https' if config.server.tls else 'http'
-    host = config.server.bind
-    if ':' in host:
-        host = f'[{host}]'
-    print(
-        f'serving on {scheme}://{host}:{server.server_address[1]}',
-        file=sys.stderr,
-    )
-    try:
+        print(startup, file=stderr, flush=True)
         server.serve_forever()
     except KeyboardInterrupt:
         pass
@@ -543,15 +533,116 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _cmd_serve(args: argparse.Namespace, writer: ServiceWriter, stderr: TextIO) -> int:
+    """Run the broker service until interrupted."""
+    try:
+        config = load_config(Path(args.config))
+    except ConfigError as exc:
+        _report_error(str(exc), stream=stderr)
+        return 2
+    key_errors = _resolve_config_keys(config)
+    if key_errors:
+        _report_error('; '.join(key_errors), stream=stderr)
+        return 2
+    service = BrokerService(
+        config=config,
+        minter=SGMinter(config.site_url),
+        audit=AuditLogger(writer),
+    )
+    try:
+        server = create_server(config, service)
+    except ssl.SSLError as exc:
+        _report_error(f'cannot load the TLS certificate and key: {exc}', stream=stderr)
+        return 2
+    except OSError as exc:
+        _report_error(
+            f'cannot start the broker on port {config.server.port}: {exc.strerror or exc}',
+            stream=stderr,
+        )
+        return 1
+    scheme = 'https' if config.server.tls else 'http'
+    host = config.server.bind
+    if ':' in host:
+        host = f'[{host}]'
+    return _serve(
+        server, writer, stderr, f'serving on {scheme}://{host}:{server.server_address[1]}'
+    )
+
+
+def _cmd_serve_user_tokens(args: argparse.Namespace, writer: ServiceWriter, stderr: TextIO) -> int:
+    """Run the user-token service until interrupted."""
+    del args
+    try:
+        config = load_user_token_config(os.environ)
+    except UserConfigError as exc:
+        _report_error(str(exc), stream=stderr)
+        return 2
+    claims: ClaimsPolicy
+    if config.provider == 'oidc':
+        issuer = config.issuer
+        if issuer is None:  # enforced by load_user_token_config
+            raise RuntimeError('OIDC provider has no issuer')
+        try:
+            verifier = oidc_verifier(issuer, config.oidc_algorithms)
+        except OidcUnavailableError as exc:
+            _report_error(str(exc), stream=stderr)
+            return 2
+        except (ValueError, requests.RequestException) as exc:
+            _report_error(f'cannot verify identity tokens: {exc}', stream=stderr)
+            return 1
+        claims = OidcClaimsValidator(
+            verifier,
+            config.audiences,
+            config.allowed_domain,
+            email_claim=config.email_claim,
+            assume_email_verified=config.assume_email_verified,
+        )
+    else:
+        try:
+            claims = ClaimsValidator(
+                google_auth_verifier(), config.audiences, config.allowed_domain
+            )
+        except VerifierUnavailableError as exc:
+            _report_error(str(exc), stream=stderr)
+            return 2
+    minter = SGMinter(config.site_url)
+    service = UserTokenService(
+        ServiceAccount(config.site_url, config.script_name, config.script_key),
+        claims,
+        UserDirectory(config.site_url, minter, config.script_name, config.script_key),
+        minter,
+        AuditLogger(writer),
+        token_types=config.token_types,
+        session_ttl_seconds=config.session_ttl_seconds,
+    )
+    # The default '' binds all interfaces, which Cloud Run requires.
+    try:
+        server = create_user_token_server(
+            config.bind, config.port, service, trusted_proxies=config.trusted_proxies
+        )
+    except OSError as exc:
+        _report_error(
+            f'cannot start the user-token service on port {config.port}: {exc.strerror or exc}',
+            stream=stderr,
+        )
+        return 1
+    return _serve(
+        server, writer, stderr, f'serving user tokens on port {server.server_address[1]}'
+    )
+
+
+def _build_parser(*, replacement: bool = False) -> argparse.ArgumentParser:
     """Build the argument parser with all subcommands."""
-    parser = _RootParser(
+    root_class = _ReplacementRootParser if replacement else _RootParser
+    parser = root_class(
         prog='sg-token-broker',
         description='Issue SG tokens to pipeline tools without giving them SG script keys.',
     )
     parser.add_argument('--version', action='store_true', help='show the version and exit')
     commands = parser.add_subparsers(
-        dest='command', metavar='COMMAND', parser_class=argparse.ArgumentParser
+        dest='command',
+        metavar='COMMAND',
+        parser_class=_ReplacementParser if replacement else StrictParser,
     )
 
     serve = commands.add_parser(
@@ -622,21 +713,15 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=['session', 'rest'],
         help='token type to request (default: session)',
     )
+    get_request.add_argument(
+        '--replace-rejected',
+        action='store_true',
+        help=(
+            f'pipe up to {_MAX_REJECTED_TOKENS} recently rejected tokens on standard input, '
+            'one per line, to request a replacement'
+        ),
+    )
     get_connection = get.add_argument_group('connection')
-    get_connection.add_argument(
-        '--timeout',
-        type=_positive_finite_float,
-        default=10.0,
-        metavar='SECONDS',
-        help='seconds to wait for each broker request (default: 10)',
-    )
-    get_connection.add_argument(
-        '--retries',
-        type=_non_negative_int,
-        default=2,
-        metavar='COUNT',
-        help='retries after a connection failure or server error (default: 2)',
-    )
     get.set_defaults(func=_cmd_get_token)
 
     login = commands.add_parser(
@@ -669,17 +754,50 @@ def _build_parser() -> argparse.ArgumentParser:
             'JSON, signing in through the browser when no stored credential is available.'
         ),
     )
-    get_user.add_argument(
+    user_request = get_user.add_argument_group('request')
+    user_request.add_argument(
         '--token-type',
         default='session',
         choices=['session', 'rest'],
         help='token type to request (default: session)',
     )
-    get_user.add_argument(
+    user_request.add_argument(
         '--force-refresh',
         action='store_true',
         help='ask the service to check its cached session with SG and replace it if SG rejects it',
     )
+    for command, requests_start in (
+        (get_connection, 'broker requests'),
+        (get_user.add_argument_group('connection'), 'service requests after sign-in'),
+    ):
+        command.add_argument(
+            '--timeout',
+            type=_positive_finite_float,
+            default=DEFAULT_TIMEOUT_SECONDS,
+            metavar='SECONDS',
+            help='seconds to wait for each request (default: %(default)g)',
+        )
+        command.add_argument(
+            '--max-wait',
+            type=_positive_finite_float,
+            default=DEFAULT_MAX_WAIT_SECONDS,
+            metavar='SECONDS',
+            help=(
+                f'time budget for starting {requests_start}; a request already in progress '
+                'may finish later (default: %(default)g seconds)'
+            ),
+        )
+        retry_default = 'no cap' if DEFAULT_RETRIES is None else '%(default)d'
+        command.add_argument(
+            '--retries',
+            type=_non_negative_int,
+            default=DEFAULT_RETRIES,
+            metavar='COUNT',
+            help=(
+                'maximum retries within --max-wait; use 0 for one request '
+                f'(default: {retry_default})'
+            ),
+        )
     get_user.set_defaults(func=_cmd_get_user_token)
 
     verify = commands.add_parser(
@@ -733,16 +851,36 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run(arguments: list[str]) -> int:
+def _uses_replacement(arguments: list[str]) -> bool:
+    """Redact usage errors wherever --replace-rejected or a prefix starting with --rep appears."""
+    return any(
+        arg.startswith('--rep') and '--replace-rejected'.startswith(arg.partition('=')[0])
+        for arg in arguments
+    )
+
+
+def _run(arguments: list[str], *, standalone: bool) -> int:
     """Parse arguments and run the selected command."""
-    parser = _build_parser()
-    args = parser.parse_args(arguments)
-    if args.version:
-        return _print_version()
-    if args.command is None:
-        parser.error('the following arguments are required: COMMAND')
-    result: int = args.func(args)
-    return result
+    with closable_stdout():
+        parser = _build_parser(replacement=_uses_replacement(arguments))
+        args = parser.parse_args(arguments)
+        if args.version:
+            return _print_version()
+        if args.command is None:
+            parser.error('the following arguments are required: COMMAND')
+        if args.func not in (_cmd_serve, _cmd_serve_user_tokens):
+            result: int = args.func(args)
+            return result
+    if standalone:
+        signal.signal(signal.SIGTERM, _exit_on_stop)
+        signal.signal(signal.SIGINT, _exit_on_stop)
+    with service_streams(standalone=standalone) as (stdout, stderr):
+        user_service = args.func is _cmd_serve_user_tokens
+        with service_logging(
+            discard_closed_output(stdout) if user_service else stderr,
+            'sg_token_broker.userhttp' if user_service else 'sg_token_broker.http',
+        ) as writer:
+            return args.func(args, writer, stderr)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -753,14 +891,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     outcome.
 
     Args:
-        argv: Arguments to parse, or `None` to use `sys.argv[1:]`.
+        argv: Explicit arguments are an internal test seam, not a supported
+            embedding API. With `None`, read `sys.argv[1:]` as the standalone
+            entry point. Service commands then own the process streams through
+            exit. SIGTERM and SIGINT end them immediately with status 143 and
+            130, respectively.
 
     Returns:
         The command's exit status, 2 if standard output is unavailable, or
         130 if a keyboard interrupt stops command execution.
 
     Raises:
-        SystemExit: With status 0 for help or 2 for invalid arguments.
+        SystemExit: With status 0 for help, 1 for an uncaught service error or
+            2 for invalid arguments.
         EOFError: If an interactive prompt reaches end-of-input.
         OSError: If command input, output, callback listener setup, or stdout
             cleanup fails for a reason other than an absorbed downstream
@@ -773,8 +916,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         # closed-stdout wrapper cannot wrap a missing stream.
         _report_error('standard output is unavailable')
         return 2
-    with closable_stdout():
-        try:
-            return _run(sys.argv[1:] if argv is None else list(argv))
-        except KeyboardInterrupt:
-            return 130
+    try:
+        return _run(sys.argv[1:] if argv is None else list(argv), standalone=argv is None)
+    except KeyboardInterrupt:
+        return 130

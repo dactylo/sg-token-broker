@@ -1,0 +1,17 @@
+*
+!src
+!src/**
+!pyproject.toml
+!README.md
+!LICENSE
+!requirements-ci.txt
+!requirements-test.txt
+!requirements-image.txt
+!docs
+docs/*
+!docs/reverse-proxy.conf
+!benchmarks
+!benchmarks/**
+**/__pycache__
+**/*.pyc
+**/.DS_Store

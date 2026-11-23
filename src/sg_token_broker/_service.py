@@ -1,31 +1,38 @@
 """Authenticate, authorize, mint, and audit broker token requests."""
 
 import datetime
-import functools
-import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Protocol, TypeAlias
+from typing import Protocol
 
+from sg_token_broker._admission import SecretVerifier, ServerBusyError, WaitingShare
 from sg_token_broker._audit import AuditLogger
-from sg_token_broker._cache import TTLCache
 from sg_token_broker._config import CLIENT_ID_MAX_CHARS, BrokerConfig, ScopeConfig
+from sg_token_broker._issuance import (
+    CachedMint,
+    IssueOutcome,
+    KeyedIssuer,
+    MintBudget,
+    MintPlan,
+    MintRateLimitedError,
+    UpstreamFailureError,
+)
 from sg_token_broker._secrets import (
     SecretError,
-    hash_secret,
     resolve_script_key,
     token_fingerprint,
-    verify_secret,
 )
-from sg_token_broker._sg import MintedToken, SGError
+from sg_token_broker._sg import (
+    MintedToken,
+    SGError,
+    SGInvalidResponseError,
+)
 
-_RATE_WINDOW_SECONDS = 60.0
 _REST_CACHE_TTL_SECONDS = 60.0
 _REST_EXPIRY_MARGIN_SECONDS = 60
 _REST_TYPE = 'rest'
 _SESSION_TYPE = 'session'
-_CachedMint: TypeAlias = tuple[MintedToken, datetime.datetime]
 
 
 class BrokerError(Exception):
@@ -34,11 +41,13 @@ class BrokerError(Exception):
     Attributes:
         status: HTTP status returned for the failure.
         error: Error code returned in the response body.
+        retry_after: Seconds to wait before retrying, if specified.
         reason: Optional audit-reason override for pre-service HTTP denials.
     """
 
     status = 500
     error = 'internal_error'
+    retry_after: float | None = None
     reason: str = ''
 
 
@@ -82,6 +91,8 @@ class TokenRequest:
         source_ip: Request source IP address. Defaults to an empty string.
         request_id: Request correlation identifier. Defaults to an empty
             string.
+        rejected_digests: Full SHA-256 digests of tokens SG rejected for this
+            key.
     """
 
     client_id: str
@@ -90,6 +101,7 @@ class TokenRequest:
     token_type: str = _SESSION_TYPE
     source_ip: str = ''
     request_id: str = ''
+    rejected_digests: frozenset[str] = frozenset()
 
 
 class _ForbiddenError(BrokerError):
@@ -140,34 +152,44 @@ class BrokerService:
         self,
         config: BrokerConfig,
         minter: _Minter,
-        cache: TTLCache[_CachedMint],
         audit: AuditLogger,
+        *,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Bind policy, minting, caching, and audit collaborators.
 
         Args:
             config: Validated broker configuration.
             minter: Upstream SG token minter.
-            cache: Token cache keyed by client, scope, and token type.
             audit: Audit logger.
+            clock: Monotonic seconds for admission windows and cache expiry.
         """
         self._config = config
         self._minter = minter
-        self._cache = cache
         self._audit = audit
-        self._rate_limiter = _RateLimiter()
-        _dummy_hash()  # Pay the one-time hash before serving, not on the first unknown client.
+        self._waiting = WaitingShare(24)
+        self._verifier = SecretVerifier(
+            waiting=self._waiting, work=config.max_secret_hashes, clock=clock
+        )
+        self._issuer = KeyedIssuer(waiting=self._waiting, budget=MintBudget(clock), clock=clock)
 
-    def _authorize(self, request: TokenRequest) -> None:
-        """Authenticate the client, then enforce its rate limit, scopes, and token types."""
+    def _authenticate(self, request: TokenRequest) -> str:
+        """Authenticate the presented secret and return its configured credential ID."""
         client = self._config.clients.get(request.client_id)
-        if client is None:
-            verify_secret(request.client_secret, _dummy_hash())
-            raise InvalidClientError('unknown client or bad secret')
-        if not verify_secret(request.client_secret, client.secret_hash):
-            raise InvalidClientError('unknown client or bad secret')
-        if not self._rate_limiter.check(client.client_id, client.rate_limit_per_minute):
-            raise _RateLimitedError('per-client rate limit exceeded')
+        credentials = (
+            tuple(zip(client.credential_ids, client.secret_hashes, strict=True)) if client else ()
+        )
+        try:
+            matched = self._verifier.verify(request.client_id, credentials, request.client_secret)
+        except ServerBusyError as exc:
+            raise _ServerBusyError(retry_after=exc.retry_after) from exc
+        if matched is not None:
+            return matched
+        raise InvalidClientError('unknown client or bad secret')
+
+    def _check_policy(self, request: TokenRequest) -> None:
+        """Enforce the authenticated client's allowed scopes and token types."""
+        client = self._config.clients[request.client_id]
         if request.token_type not in (_SESSION_TYPE, _REST_TYPE):
             raise BadRequestError(f'unknown token_type {request.token_type!r}')
         if request.scope not in client.scopes:
@@ -175,41 +197,44 @@ class BrokerService:
         if request.token_type not in client.token_types:
             raise _ForbiddenError(f'token_type {request.token_type!r} not allowed for this client')
 
-    def _issue(self, request: TokenRequest) -> tuple[_IssuedToken, bool]:
-        """Run the authenticate, authorize, mint pipeline."""
-        self._authorize(request)
+    def _issue(self, request: TokenRequest) -> tuple[_IssuedToken, IssueOutcome]:
+        """Reuse or mint a token for an authorized request."""
         scope = self._config.scopes[request.scope]
 
         session_ttl = float(self._config.session_ttl_seconds)
 
-        def mint() -> _CachedMint:
+        def mint(charge: Callable[[], None]) -> CachedMint:
             key = _resolve_scope_key(scope)
-            try:
-                if request.token_type == _SESSION_TYPE:
-                    minted = self._minter.mint_session_token(scope.script_name, key)
-                else:
-                    minted = self._minter.mint_rest_token(scope.script_name, key)
-            except SGError as exc:
-                raise _UpstreamError('SG upstream request failed') from exc
-            lifetime = (
-                session_ttl
-                if minted.expires_in is None
-                else max(float(minted.expires_in - _REST_EXPIRY_MARGIN_SECONDS), 1.0)
-            )
+            charge()
+            if request.token_type == _SESSION_TYPE:
+                minted = self._minter.mint_session_token(scope.script_name, key)
+            else:
+                minted = self._minter.mint_rest_token(scope.script_name, key)
+            lifetime = session_ttl
+            if minted.expires_in is not None:
+                lifetime = minted.expires_in - _REST_EXPIRY_MARGIN_SECONDS
+                if lifetime <= 0:
+                    raise SGInvalidResponseError('SG token lifetime too short to serve')
             return minted, _utcnow() + datetime.timedelta(seconds=lifetime)
 
-        cache_key = (request.client_id, request.scope, request.token_type)
-        if request.token_type == _REST_TYPE:
-            (minted, expires_at), cache_hit = self._cache.revalidate_or_replace(
-                cache_key,
-                _REST_CACHE_TTL_SECONDS,
-                lambda cached: _utcnow() < cached[1],
-                mint,
+        is_rest = request.token_type == _REST_TYPE
+        try:
+            (minted, expires_at), outcome = self._issuer.issue(
+                (request.client_id, request.scope, request.token_type),
+                MintPlan(
+                    mint=mint,
+                    ttl=_REST_CACHE_TTL_SECONDS if is_rest else session_ttl,
+                    still_valid=lambda cached: not is_rest or _utcnow() < cached[1],
+                ),
+                rate_limit=self._config.clients[request.client_id].rate_limit_per_minute,
+                rejected=request.rejected_digests,
             )
-        else:
-            (minted, expires_at), cache_hit = self._cache.get_or_create(
-                cache_key, session_ttl, mint
-            )
+        except ServerBusyError as exc:
+            raise _ServerBusyError(retry_after=exc.retry_after) from exc
+        except MintRateLimitedError as exc:
+            raise _RateLimitedError(retry_after=exc.retry_after) from exc
+        except UpstreamFailureError as exc:
+            raise _upstream_error(exc) from (exc.__cause__ or exc)
         issued = _IssuedToken(
             token=minted.token,
             token_type=request.token_type,
@@ -217,7 +242,7 @@ class BrokerService:
             site_url=self._config.site_url,
             expires_at=expires_at,
         )
-        return issued, cache_hit
+        return issued, outcome
 
     def issue_token(self, request: TokenRequest) -> _IssuedToken:
         """Issue a token for an authenticated, authorized client request.
@@ -232,13 +257,18 @@ class BrokerService:
             BrokerError: A request-level failure, either this base class or a
                 subclass, carrying the HTTP status and error code.
         """
+        credential = None
         try:
-            issued, cache_hit = self._issue(request)
+            credential = self._authenticate(request)
+            self._check_policy(request)
+            issued, outcome = self._issue(request)
         except BrokerError as exc:
             threshold = 500
             extra: dict[str, object] = {}
-            if isinstance(exc, _UpstreamError):
-                extra['detail'] = str(exc.__cause__ or exc)
+            if credential is not None:
+                extra['credential'] = credential
+            if isinstance(exc.__cause__, SGError):
+                extra['detail'] = exc.__cause__.audit_detail
             elif isinstance(exc.__cause__, SecretError):
                 extra['detail'] = str(exc.__cause__)
             self._audit.log(
@@ -259,10 +289,13 @@ class BrokerService:
         self._audit.log(
             'issue',
             client_id=request.client_id,
+            credential=credential,
             scope=request.scope,
             token_type=request.token_type,
             token_fp=token_fingerprint(issued.token),
-            cache='hit' if cache_hit else 'miss',
+            cache='hit' if outcome in ('hit', 'joined') else 'miss',
+            outcome=outcome,
+            **({'replaced': True} if outcome == 'replaced' else {}),
             source_ip=request.source_ip,
             request_id=request.request_id,
         )
@@ -301,6 +334,51 @@ class BrokerService:
         )
 
 
+class _ServerBusyError(BrokerError):
+    """Broker capacity is exhausted and the caller may retry shortly."""
+
+    status = 503
+    error = 'server_busy'
+
+    def __init__(self, *, retry_after: float) -> None:
+        """Report the wait before a caller retries."""
+        super().__init__('server busy')
+        self.retry_after = retry_after
+
+
+class _RateLimitedError(BrokerError):
+    """The client exceeded its per-minute mint budget."""
+
+    status = 429
+    error = 'rate_limited'
+
+    def __init__(self, *, retry_after: float) -> None:
+        """Report when the client can spend from its mint budget again."""
+        super().__init__('per-client mint rate limit exceeded')
+        self.retry_after = retry_after
+
+
+class _SGRejectedError(BrokerError):
+    """SG refused the upstream request."""
+
+    status = 502
+    error = 'sg_rejected'
+
+
+class _InvalidUpstreamResponseError(BrokerError):
+    """SG returned a successful response with unusable data."""
+
+    status = 502
+    error = 'sg_invalid_response'
+
+
+class _UpstreamUnavailableError(BrokerError):
+    """SG could not complete the request and a later retry may succeed."""
+
+    status = 503
+    error = 'upstream_unavailable'
+
+
 def _audit_client_id(client_id: str) -> dict[str, object]:
     """Bound a caller-supplied client id for the audit log."""
     if len(client_id) <= CLIENT_ID_MAX_CHARS:
@@ -311,66 +389,24 @@ def _audit_client_id(client_id: str) -> dict[str, object]:
     }
 
 
-@functools.cache
-def _dummy_hash() -> str:
-    """Return the scrypt hash verified for unknown client ids, computed once per process."""
-    # Unknown and known clients take the same scrypt time, so timing cannot
-    # enumerate client ids. Only the broker needs it, so CLI commands skip it.
-    return hash_secret('timing-equalizer')
-
-
-class _RateLimitedError(BrokerError):
-    """The client exceeded its per-minute request budget."""
-
-    status = 429
-    error = 'rate_limited'
-
-
-class _RateLimiter:
-    """Fixed-window per-client rate limiter."""
-
-    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
-        """Start with no recorded requests using the selected clock."""
-        self._clock = clock
-        self._lock = threading.Lock()
-        self._windows: dict[str, tuple[float, int]] = {}
-
-    def check(self, client_id: str, limit: int) -> bool:
-        """Record one client request and report whether its window has capacity.
-
-        Args:
-            client_id: Client whose requests share a rate window.
-            limit: Maximum requests allowed in the window.
-
-        Returns:
-            Whether this request was accepted within the client's current
-            window.
-        """
-        now = self._clock()
-        with self._lock:
-            start, count = self._windows.get(client_id, (now, 0))
-            if now - start >= _RATE_WINDOW_SECONDS:
-                start, count = now, 0
-            if count >= limit:
-                self._windows[client_id] = (start, count)
-                return False
-            self._windows[client_id] = (start, count + 1)
-            return True
-
-
-class _UpstreamError(BrokerError):
-    """SG itself failed; details are logged server-side only."""
-
-    status = 502
-    error = 'upstream_error'
-
-
 def _resolve_scope_key(scope: ScopeConfig) -> str:
     """Resolve a scope's script key behind the broker error boundary."""
     try:
         return resolve_script_key(env=scope.script_key_env, file=scope.script_key_file)
     except SecretError as exc:
         raise BrokerError('internal error') from exc
+
+
+def _upstream_error(failure: UpstreamFailureError) -> BrokerError:
+    """Choose the service error for the classified SG failure."""
+    error_type = {
+        'rejected': _SGRejectedError,
+        'invalid_response': _InvalidUpstreamResponseError,
+        'unavailable': _UpstreamUnavailableError,
+    }[failure.kind]
+    error = error_type('SG upstream request failed')
+    error.retry_after = failure.retry_after
+    return error
 
 
 def _utcnow() -> datetime.datetime:

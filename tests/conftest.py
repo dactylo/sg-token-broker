@@ -11,12 +11,13 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 import requests
 
+from sg_token_broker import _http, _userhttp, _users
 from sg_token_broker._audit import AuditLogger
-from sg_token_broker._cache import TTLCache
 from sg_token_broker._config import load_config
 from sg_token_broker._http import create_server
 from sg_token_broker._service import BrokerService
 from sg_token_broker._sg import SGMinter
+from tests._timeouts import STALL_TIMEOUT_SECONDS
 
 _API_USER_ENTITY: dict[str, object] = {'type': 'ApiUser', 'id': 2442, 'name': 'fake_script'}
 BROKER_CREDENTIAL = 'farm-credential'
@@ -25,6 +26,7 @@ BROKER_HASH = (
     'scrypt$16384$8$1$tcz9OTN0w9hLf2Zh12rdKQ==$'
     'awBt8momr/VzxYTd7/N+PmovkQUbLjh48W5GCf/2yUlprwvi/nWejmNmwCWgsPo5wy/dsyY/b6t/DCDF6l1C3Q=='
 )
+REST_REFRESH_MARKER = 'refresh-should-never-leak'
 
 
 @dataclass
@@ -114,6 +116,7 @@ class FakeSG:
     rpc_response_overrides: list[tuple[int, dict[str, object]] | None] = field(
         default_factory=list[tuple[int, dict[str, object]] | None]
     )
+    disconnect_path: str | None = None
     hard_fail: bool = False
     site_authentication_method: object = 'default'
 
@@ -300,7 +303,7 @@ def _rest_response(state: FakeSG, raw: str) -> tuple[int, dict[str, object] | st
         'access_token': token,
         'token_type': 'Bearer',
         'expires_in': state.rest_expires_in,
-        'refresh_token': 'refresh-should-never-leak',
+        'refresh_token': REST_REFRESH_MARKER,
     }
 
 
@@ -732,7 +735,7 @@ def _make_handler(state: FakeSG) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(payload)
 
         def do_POST(self) -> None:
-            if state.hard_fail:
+            if state.hard_fail or urlsplit(self.path).path == state.disconnect_path:
                 self.connection.close()
                 return
             length = int(self.headers.get('Content-Length', '0'))
@@ -747,7 +750,7 @@ def _make_handler(state: FakeSG) -> type[BaseHTTPRequestHandler]:
             self._send(404, {'errors': [{'title': 'not found'}]})
 
         def do_GET(self) -> None:
-            if state.hard_fail:
+            if state.hard_fail or urlsplit(self.path).path == state.disconnect_path:
                 self.connection.close()
                 return
             bearer = self.headers.get('Authorization', '').removeprefix('Bearer ')
@@ -766,18 +769,50 @@ def fake_sg() -> Iterator[FakeSG]:
         target=server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True
     )
     thread.start()
-    yield state
-    server.shutdown()
-    server.server_close()
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 @pytest.fixture
-def broker_url(fake_sg: FakeSG, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+def broker_rate_limit() -> int:
+    return 60
+
+
+@pytest.fixture
+def broker_clock() -> Mock:
+    return Mock(return_value=0.0)
+
+
+def _serve_broker(
+    fake_sg: FakeSG | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    broker_rate_limit: int,
+    broker_clock: Mock,
+) -> Iterator[str]:
     monkeypatch.setenv('SGTB_KEY_READ_ALL', 'masterkey')
-    fake_sg.rest_credentials = {'broker_read_all': 'masterkey'}
+    if fake_sg is None:
+        site_url = 'https://studio.example'
+        minter = Mock(spec_set=SGMinter)
+        for method in (
+            minter.check_session_token,
+            minter.mint_session_token,
+            minter.mint_rest_token,
+        ):
+            method.side_effect = AssertionError('unexpected SG request')
+    else:
+        site_url = fake_sg.url
+        fake_sg.rest_credentials = {'broker_read_all': 'masterkey'}
+        minter = SGMinter(site_url, timeout=STALL_TIMEOUT_SECONDS)
     cfg_path = tmp_path / 'broker.yml'
     cfg_path.write_text(f"""
-site_url: {fake_sg.url}
+site_url: {site_url}
+defaults:
+  rate_limit_per_minute: {broker_rate_limit}
 server:
   bind: 127.0.0.1
   port: 0
@@ -793,8 +828,8 @@ clients:
     config = load_config(cfg_path)
     service = BrokerService(
         config=config,
-        minter=SGMinter(config.site_url),
-        cache=TTLCache(),
+        minter=minter,
+        clock=broker_clock,
         audit=AuditLogger(),
     )
     server = create_server(config, service)
@@ -802,9 +837,35 @@ clients:
         target=server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True
     )
     thread.start()
-    yield f'http://127.0.0.1:{server.server_address[1]}'
-    server.shutdown()
-    server.server_close()
+    try:
+        yield f'http://127.0.0.1:{server.server_address[1]}'
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        if isinstance(minter, Mock):
+            assert minter.method_calls == []
+
+
+@pytest.fixture
+def broker_url(
+    fake_sg: FakeSG,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    broker_rate_limit: int,
+    broker_clock: Mock,
+) -> Iterator[str]:
+    yield from _serve_broker(fake_sg, tmp_path, monkeypatch, broker_rate_limit, broker_clock)
+
+
+@pytest.fixture
+def http_only_broker_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    broker_rate_limit: int,
+    broker_clock: Mock,
+) -> Iterator[str]:
+    yield from _serve_broker(None, tmp_path, monkeypatch, broker_rate_limit, broker_clock)
 
 
 @pytest.fixture
@@ -812,6 +873,13 @@ def no_requests(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         requests.Session, 'request', Mock(side_effect=AssertionError('unexpected HTTP request'))
     )
+
+
+@pytest.fixture(autouse=True)
+def stall_detectors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_http._Handler, 'timeout', STALL_TIMEOUT_SECONDS)
+    monkeypatch.setattr(_userhttp._Handler, 'timeout', STALL_TIMEOUT_SECONDS)
+    monkeypatch.setattr(_users, '_REQUEST_TIMEOUT_SECONDS', STALL_TIMEOUT_SECONDS)
 
 
 @pytest.fixture

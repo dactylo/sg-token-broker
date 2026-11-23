@@ -116,11 +116,13 @@ class VerifySetupError(Exception):
 
 
 def _old_key_rejected(minter: _RevocationMinter, script_name: str, script_key: str) -> bool:
-    """Return True if minting with the (now rotated) key fails as expected."""
+    """Return True for explicit credential rejection and propagate inconclusive failures."""
     try:
         minter.mint_session_token(script_name, script_key)
-    except SGError:
-        return True
+    except SGError as exc:
+        if exc.rejected_credentials:
+            return True
+        raise
     return False
 
 
@@ -191,8 +193,8 @@ def run_revocation_check(
     Raises:
         VerifySetupError: If the first token cannot be minted or its initial
             probe explicitly rejects it.
-        SGError: If a session probe, including the initial probe, fails or has
-            an inconclusive response.
+        SGError: If a session or old-key probe fails or has an inconclusive
+            response.
         EOFError: If an interactive prompt reaches end-of-input.
         OSError: If interactive input or output fails.
     """

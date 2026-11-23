@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -5,6 +6,7 @@ import pytest
 
 from sg_token_broker._config import ConfigError, load_config
 from tests._tls import write_tls_material
+from tests.conftest import BROKER_HASH
 
 _VALID = """
 site_url: https://studio.shotgunstudio.com
@@ -28,23 +30,19 @@ _VALID_HASH = (
     'scrypt$16384$8$1$tvgu3S28sX35pfwGM4X15A==$'
     'eIy4ZbBCDrTwa1WOeMsXcrN+zdAPoOSK5/2nkjOTGwwBo+j3pzLXHHPaiQLOf+xay8OGpCAFvkgC4Z+WyA/ziA=='
 )
+# Both Base64 fields end in A==. Changing its unused bits preserves their decoded bytes.
+_EQUIVALENT_HASH = _VALID_HASH.replace('A==', 'B==')
 
 
 class TestLoadConfig:
     def test_bad_hash_rejected(self, tmp_path: Path) -> None:
         text = _VALID.format(h='plaintext-oops')
-        with pytest.raises(ConfigError, match='secret_hash'):
+        with pytest.raises(ConfigError, match=r'clients\.farm\.secret_hash .*hash-secret'):
             load_config(_write(tmp_path, text))
 
     def test_bad_site_url_rejected(self, tmp_path: Path) -> None:
         text = _valid_text().replace('https://studio.shotgunstudio.com', 'ftp://x')
         with pytest.raises(ConfigError, match='site_url'):
-            load_config(_write(tmp_path, text))
-
-    @pytest.mark.parametrize('client_id', ['', 'a:b', 'café', 'x' * 65, 'tab\there', 'with space'])
-    def test_client_id_grammar(self, tmp_path: Path, client_id: str) -> None:
-        text = _valid_text().replace('  farm:', f'  {json.dumps(client_id)}:', 1)
-        with pytest.raises(ConfigError, match='client id must be'):
             load_config(_write(tmp_path, text))
 
     def test_defaults_applied(self, tmp_path: Path) -> None:
@@ -56,23 +54,6 @@ class TestLoadConfig:
         assert cfg.clients['farm'].rate_limit_per_minute == 60
         assert cfg.clients['farm'].token_types == frozenset({'session', 'rest'})
 
-    @pytest.mark.parametrize('value', ['[]', '[jwt]', 'rest', '[[rest]]'])
-    @pytest.mark.parametrize(
-        ('needle', 'where'),
-        [
-            ('  rate_limit_per_minute: 30\n', 'defaults.token_types'),
-            ('    scopes: [read_all]\n', 'clients.farm.token_types'),
-        ],
-        ids=['defaults', 'client'],
-    )
-    def test_invalid_token_types_rejected(
-        self, tmp_path: Path, needle: str, where: str, value: str
-    ) -> None:
-        indent = needle[: len(needle) - len(needle.lstrip())]
-        text = _valid_text().replace(needle, f'{needle}{indent}token_types: {value}\n', 1)
-        with pytest.raises(ConfigError, match=where):
-            load_config(_write(tmp_path, text))
-
     def test_loopback_http_site_url_accepted(self, tmp_path: Path) -> None:
         text = _valid_text().replace('https://studio.shotgunstudio.com', 'http://127.0.0.1:8888')
         assert load_config(_write(tmp_path, text)).site_url == 'http://127.0.0.1:8888'
@@ -82,22 +63,6 @@ class TestLoadConfig:
         config = load_config(_write(tmp_path, text))
         assert config.server.bind == '::1'
         assert config.server.tls is None
-
-    def test_malformed_scrypt_hash_rejected(self, tmp_path: Path) -> None:
-        text = _VALID.format(h='scrypt$3$8$1$c2FsdA==$ZGlnZXN0')
-        with pytest.raises(ConfigError, match='secret_hash'):
-            load_config(_write(tmp_path, text))
-
-    @pytest.mark.parametrize(
-        ('old', 'new', 'where'),
-        [('  read_all:', '  7:', 'scopes'), ('  farm:', '  7:', 'clients')],
-    )
-    def test_mapping_keys_must_be_strings(
-        self, tmp_path: Path, old: str, new: str, where: str
-    ) -> None:
-        text = _valid_text().replace(old, new, 1)
-        with pytest.raises(ConfigError, match=rf'{where} keys must be strings'):
-            load_config(_write(tmp_path, text))
 
     def test_mismatched_tls_pair_is_a_config_error(self, tmp_path: Path) -> None:
         directory_a = tmp_path / 'a'
@@ -123,12 +88,6 @@ class TestLoadConfig:
         with pytest.raises(ConfigError, match='client'):
             load_config(_write(tmp_path, text))
 
-    @pytest.mark.parametrize('host', ['10.1.2.3', '2001:db8::1'])
-    def test_non_loopback_without_tls_rejected(self, tmp_path: Path, host: str) -> None:
-        text = _valid_text().replace('bind: 127.0.0.1', f'bind: "{host}"')
-        with pytest.raises(ConfigError, match='TLS'):
-            load_config(_write(tmp_path, text))
-
     def test_non_utf8_config_is_a_config_error(self, tmp_path: Path) -> None:
         path = tmp_path / 'broker.yml'
         path.write_bytes(b'# caf\xe9\n' + _valid_text().encode())
@@ -140,6 +99,112 @@ class TestLoadConfig:
             'https://studio.shotgunstudio.com', 'http://sg.studio.internal'
         )
         with pytest.raises(ConfigError, match='site_url'):
+            load_config(_write(tmp_path, text))
+
+    def test_scope_needs_exactly_one_key_source(self, tmp_path: Path) -> None:
+        text = _valid_text().replace(
+            'script_key_env: SGTB_KEY_READ_ALL',
+            'script_key_env: A\n    script_key_file: /b',
+        )
+        with pytest.raises(ConfigError, match='script_key'):
+            load_config(_write(tmp_path, text))
+
+    @pytest.mark.parametrize(
+        ('setting', 'expected'),
+        [
+            (f'secret_hash: "{_VALID_HASH}"', (_VALID_HASH,)),
+            (f'secret_hash: "{_EQUIVALENT_HASH}"', (_EQUIVALENT_HASH,)),
+            (f'secret_hashes: ["{_VALID_HASH}"]', (_VALID_HASH,)),
+            (f'secret_hashes: ["{_VALID_HASH}", "{BROKER_HASH}"]', (_VALID_HASH, BROKER_HASH)),
+        ],
+        ids=['legacy', 'legacy-alternate-encoding', 'one', 'two'],
+    )
+    def test_secret_hash_forms_keep_ordered_credential_ids(
+        self, tmp_path: Path, setting: str, expected: tuple[str, ...]
+    ) -> None:
+        text = _valid_text().replace(f'secret_hash: "{_VALID_HASH}"', setting)
+        cfg = load_config(_write(tmp_path, text))
+        client = cfg.clients['farm']
+        assert client.secret_hashes == expected
+        assert client.credential_ids == tuple(
+            hashlib.sha256(value.encode()).hexdigest()[:12] for value in expected
+        )
+        assert len(set(client.credential_ids)) == len(expected)
+        assert cfg.max_secret_hashes == len(expected)
+
+    @pytest.mark.parametrize(
+        ('setting', 'fix'),
+        [
+            ('secret_hashes: []', 'one or two'),
+            (f'secret_hashes: ["{_VALID_HASH}", "{BROKER_HASH}", "third"]', 'one or two'),
+            (f'secret_hashes: ["{_VALID_HASH}", "{_VALID_HASH}"]', 'distinct'),
+            (f'secret_hashes: ["{_VALID_HASH}", "{_EQUIVALENT_HASH}"]', 'distinct'),
+            (f'secret_hashes: ["{_VALID_HASH}", "malformed"]', 'hash-secret'),
+            (f'secret_hashes: ["{_VALID_HASH}", 42]', 'hash-secret'),
+            (f'secret_hashes: "{_VALID_HASH}"', 'list'),
+            (f'secret_hash: "{_VALID_HASH}"\n    secret_hashes: ["{BROKER_HASH}"]', 'exactly one'),
+            ('', 'exactly one'),
+        ],
+        ids=[
+            'empty',
+            'too-many',
+            'duplicate',
+            'duplicate-alternate-encoding',
+            'malformed',
+            'non-string',
+            'scalar',
+            'both',
+            'neither',
+        ],
+    )
+    def test_invalid_client_hash_settings_name_the_fix(
+        self, tmp_path: Path, setting: str, fix: str
+    ) -> None:
+        text = _valid_text().replace(f'secret_hash: "{_VALID_HASH}"', setting)
+        with pytest.raises(ConfigError, match=fix) as caught:
+            load_config(_write(tmp_path, text))
+        assert 'clients.farm' in str(caught.value)
+        assert 'secret_hashes' in str(caught.value)
+        assert _VALID_HASH not in str(caught.value)
+
+    @pytest.mark.parametrize('client_id', ['', 'a:b', 'café', 'x' * 65, 'tab\there', 'with space'])
+    def test_client_id_grammar(self, tmp_path: Path, client_id: str) -> None:
+        text = _valid_text().replace('  farm:', f'  {json.dumps(client_id)}:', 1)
+        with pytest.raises(ConfigError, match='client id must be'):
+            load_config(_write(tmp_path, text))
+
+    @pytest.mark.parametrize('value', ['[]', '[jwt]', 'rest', '[[rest]]'])
+    @pytest.mark.parametrize(
+        ('needle', 'where'),
+        [
+            ('  rate_limit_per_minute: 30\n', 'defaults.token_types'),
+            ('    scopes: [read_all]\n', 'clients.farm.token_types'),
+        ],
+        ids=['defaults', 'client'],
+    )
+    def test_invalid_token_types_rejected(
+        self, tmp_path: Path, needle: str, where: str, value: str
+    ) -> None:
+        indent = needle[: len(needle) - len(needle.lstrip())]
+        text = _valid_text().replace(needle, f'{needle}{indent}token_types: {value}\n', 1)
+        with pytest.raises(ConfigError, match=where):
+            load_config(_write(tmp_path, text))
+
+    @pytest.mark.parametrize(
+        ('old', 'new', 'where'),
+        [('  read_all:', '  7:', 'scopes'), ('  farm:', '  7:', 'clients')],
+    )
+    def test_mapping_keys_must_be_strings(
+        self, tmp_path: Path, old: str, new: str, where: str
+    ) -> None:
+        text = _valid_text().replace(old, new, 1)
+        with pytest.raises(ConfigError, match=rf'{where} keys must be strings'):
+            load_config(_write(tmp_path, text))
+
+    @pytest.mark.parametrize('host', ['10.1.2.3', '2001:db8::1'])
+    def test_non_loopback_without_tls_rejected(self, tmp_path: Path, host: str) -> None:
+        text = _valid_text().replace('bind: 127.0.0.1', f'bind: "{host}"')
+        with pytest.raises(ConfigError, match='TLS'):
             load_config(_write(tmp_path, text))
 
     @pytest.mark.parametrize(
@@ -161,14 +226,6 @@ class TestLoadConfig:
         with pytest.raises(ConfigError, match=rf'scopes\.read_all\.{field}'):
             load_config(_write(tmp_path, text))
 
-    def test_scope_needs_exactly_one_key_source(self, tmp_path: Path) -> None:
-        text = _valid_text().replace(
-            'script_key_env: SGTB_KEY_READ_ALL',
-            'script_key_env: A\n    script_key_file: /b',
-        )
-        with pytest.raises(ConfigError, match='script_key'):
-            load_config(_write(tmp_path, text))
-
     def test_tls_files_must_exist(self, tmp_path: Path) -> None:
         text = _valid_text().replace(
             'server:\n  bind: 127.0.0.1\n  port: 8743\n',
@@ -183,10 +240,9 @@ class TestLoadConfig:
     def test_tls_paths_must_be_non_empty_strings(
         self, tmp_path: Path, field: str, value: str | None
     ) -> None:
-        cert, key = write_tls_material(tmp_path)
         lines = ''.join(
             f'    {name}: {value if name == field else path}\n'
-            for name, path in (('cert_file', cert), ('key_file', key))
+            for name, path in (('cert_file', 'cert.pem'), ('key_file', 'key.pem'))
             if name != field or value is not None
         )
         text = _valid_text().replace(
@@ -257,10 +313,10 @@ class TestLoadConfig:
             load_config(_write(tmp_path, text))
 
     def test_unknown_tls_key_rejected(self, tmp_path: Path) -> None:
-        cert, key = write_tls_material(tmp_path)
         text = _valid_text().replace(
             '  port: 8743\n',
-            f'  port: 8743\n  tls:\n    cert_file: {cert}\n    key_file: {key}\n    ca_file: x\n',
+            '  port: 8743\n  tls:\n'
+            '    cert_file: cert.pem\n    key_file: key.pem\n    ca_file: x\n',
         )
         with pytest.raises(ConfigError, match=r'unknown config key: server\.tls\.ca_file$'):
             load_config(_write(tmp_path, text))
@@ -293,11 +349,6 @@ class TestLoadConfig:
         monkeypatch.setattr('sg_token_broker._secrets.hashlib.scrypt', fail_scrypt)
 
         assert load_config(_write(tmp_path, text)).clients['farm'].client_id == 'farm'
-
-    def test_weak_secret_hash_is_rejected(self, tmp_path: Path) -> None:
-        text = _VALID.format(h='scrypt$2$1$1$c2FsdA==$AQ==')
-        with pytest.raises(ConfigError, match='secret_hash is malformed'):
-            load_config(_write(tmp_path, text))
 
     @pytest.mark.parametrize(
         ('needle', 'replacement', 'message'),

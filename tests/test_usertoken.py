@@ -1,7 +1,9 @@
 import datetime
 import json
 import logging
+import traceback
 from collections.abc import Mapping
+from unittest.mock import Mock
 from urllib.parse import parse_qs
 
 import pytest
@@ -9,7 +11,6 @@ import pytest
 from sg_token_broker import _usertoken
 from sg_token_broker._audit import AuditLogger
 from sg_token_broker._gclaims import ClaimsValidator, Verifier
-from sg_token_broker._secrets import token_fingerprint
 from sg_token_broker._sg import SGError, SGMinter
 from sg_token_broker._users import UserDirectory
 from sg_token_broker._usertoken import (
@@ -21,8 +22,8 @@ from sg_token_broker._usertoken import (
     _BadRequestError,
     _ForbiddenError,
     _UnauthorizedError,
-    _UpstreamError,
 )
+from tests._timeouts import STALL_TIMEOUT_SECONDS
 from tests.conftest import FakeSG
 
 _AUDIENCE = 'client-id-123.apps.googleusercontent.com'
@@ -99,7 +100,9 @@ class TestIssueToken:
         assert record['email'] == _EMAIL
         assert record['login'] == _LOGIN
         assert record['aud'] == _AUDIENCE
-        assert record['token_fp'] == token_fingerprint(issued.token)
+        # First 16 hex digits of SHA-256 for rest-sudo_as_login:jane.exec.
+        expected_fingerprint = '69d14779f75c4310'
+        assert record['token_fp'] == expected_fingerprint
         assert issued.token not in caplog.text
 
     def test_logins_do_not_share_cache(self, fake_sg: FakeSG) -> None:
@@ -114,22 +117,23 @@ class TestIssueToken:
         assert second.token == f'rest-sudo_as_login:{other_login}'
         assert fake_sg.rest_scopes == [f'sudo_as_login:{_LOGIN}', f'sudo_as_login:{other_login}']
 
-    def test_sg_failure_is_upstream_error(
+    def test_lookup_outage_audits_upstream_unavailable(
         self, fake_sg: FakeSG, caplog: pytest.LogCaptureFixture
     ) -> None:
         fake_sg.known_emails[_EMAIL] = _LOGIN
         fake_sg.fail_user_lookup = True
-        with caplog.at_level(logging.INFO, logger=_AUDIT_LOGGER), pytest.raises(_UpstreamError):
+        with caplog.at_level(logging.INFO, logger=_AUDIT_LOGGER), pytest.raises(UserTokenError):
             _make_service(fake_sg).issue_token(_make_request())
         record = json.loads(caplog.records[-1].getMessage())
         assert record['event'] == 'error'
-        assert record['reason'] == 'upstream_error'
+        assert record['reason'] == 'upstream_unavailable'
 
-    def test_short_sg_lifetime_is_upstream_error(self, fake_sg: FakeSG) -> None:
+    def test_short_sg_lifetime_is_invalid_response(self, fake_sg: FakeSG) -> None:
         fake_sg.known_emails[_EMAIL] = _LOGIN
         fake_sg.rest_expires_in = 120
-        with pytest.raises(_UpstreamError):
+        with pytest.raises(UserTokenError) as caught:
             _make_service(fake_sg).issue_token(_make_request())
+        assert (caught.value.status, caught.value.error) == (502, 'sg_invalid_response')
 
     @pytest.mark.parametrize(
         ('status', 'title', 'reject_key'),
@@ -142,7 +146,7 @@ class TestIssueToken:
         ],
         ids=['server-error', 'service-key', 'minter-permission', 'auth-failure', 'sudo-adjacent'],
     )
-    def test_sudo_mint_operational_failure_is_upstream_error(
+    def test_sudo_mint_failure_classification(
         self, fake_sg: FakeSG, status: int, title: str, reject_key: bool
     ) -> None:
         fake_sg.known_emails[_EMAIL] = _LOGIN
@@ -155,10 +159,11 @@ class TestIssueToken:
             fake_sg.rest_failure_status = status
             fake_sg.rest_failure_title = title
 
-        with pytest.raises(_UpstreamError) as caught:
+        with pytest.raises(UserTokenError) as caught:
             service.issue_token(_make_request())
 
-        assert caught.value.status == 502
+        expected = (503, 'upstream_unavailable') if status == 503 else (502, 'sg_rejected')
+        assert (caught.value.status, caught.value.error) == expected
         request = fake_sg.requests[-1]
         assert request['path'] == '/api/v1.1/auth/access_token'
         assert parse_qs(str(request['body']))['scope'] == [f'sudo_as_login:{_LOGIN}']
@@ -233,17 +238,22 @@ def _make_service(
     fake_sg: FakeSG,
     verifier: Verifier = _email_verifier,
     token_types: frozenset[str] = frozenset({'rest'}),
+    *,
+    session_ttl_seconds: int = 600,
 ) -> UserTokenService:
     fake_sg.rest_credentials = {'usersvc': 'svc-credential'}
-    minter = SGMinter(fake_sg.url)
-    return UserTokenService(
+    minter = SGMinter(fake_sg.url, timeout=STALL_TIMEOUT_SECONDS)
+    service = UserTokenService(
         ServiceAccount(fake_sg.url, 'usersvc', 'svc-credential'),
         ClaimsValidator(verifier, [_AUDIENCE], _DOMAIN),
         UserDirectory(fake_sg.url, minter, 'usersvc', 'svc-credential'),
         minter,
         AuditLogger(logging.getLogger(_AUDIT_LOGGER)),
         token_types=token_types,
+        session_ttl_seconds=session_ttl_seconds,
     )
+    service._cache._clock = lambda: 0.0
+    return service
 
 
 class TestSessionIssuance:
@@ -292,17 +302,19 @@ class TestSessionIssuance:
         assert second.token != first.token
         assert _sudo_mint_count(fake_sg) == 2
 
-    def test_minter_fault_is_upstream_error(self, fake_sg: FakeSG) -> None:
+    def test_minter_fault_is_sg_rejected(self, fake_sg: FakeSG) -> None:
         _enable_session_user(fake_sg)
         fake_sg.rpc_sudo_mint_failures[('usersvc', _LOGIN)] = {
             'exception': True,
             'message': "The script does not have permission to 'sudo': usersvc",
             'error_code': 102,
         }
-        with pytest.raises(_UpstreamError):
+        with pytest.raises(UserTokenError) as caught:
             _make_service(fake_sg, token_types=_SESSION_TYPES).issue_token(
                 _make_request(token_type=_SESSION_TYPE)
             )
+
+        assert (caught.value.status, caught.value.error) == (502, 'sg_rejected')
 
     def test_rest_cache_until_equals_expires_at(self, fake_sg: FakeSG) -> None:
         fake_sg.known_emails[_EMAIL] = _LOGIN
@@ -373,28 +385,49 @@ class TestSessionIssuance:
         rest = service.issue_token(_make_request())
         assert rest.token != first.token
 
-    def test_session_type_mints_sudo_session(self, fake_sg: FakeSG) -> None:
+    def test_session_type_mints_sudo_session(
+        self, fake_sg: FakeSG, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         _enable_session_user(fake_sg)
-        issued = _make_service(fake_sg, token_types=_SESSION_TYPES).issue_token(
-            _make_request(token_type=_SESSION_TYPE)
+        base = datetime.datetime(2026, 6, 12, 12, 0, tzinfo=datetime.UTC)
+        elapsed = 0
+        monkeypatch.setattr(
+            _usertoken, '_utcnow', lambda: base + datetime.timedelta(seconds=elapsed)
         )
+        service = _make_service(fake_sg, token_types=_SESSION_TYPES, session_ttl_seconds=173)
+        service._cache._clock = lambda: elapsed
+        request = _make_request(token_type=_SESSION_TYPE)
+        issued = service.issue_token(request)
         assert issued.token_type == _SESSION_TYPE
         assert issued.token.startswith('sess-sudo-mint-')
         assert issued.login == _LOGIN
         assert issued.expires_at is None
-        assert issued.cache_until > datetime.datetime.now(datetime.UTC)
+        assert issued.cache_until == base + datetime.timedelta(seconds=173)
+        elapsed = 172
+        assert service.issue_token(request) == issued
+        assert _sudo_mint_count(fake_sg) == 1
+        elapsed = 173
+        renewed = service.issue_token(request)
+        assert renewed.cache_until == base + datetime.timedelta(seconds=346)
+        assert _sudo_mint_count(fake_sg) == 2
 
-    def test_target_refusal_is_forbidden(self, fake_sg: FakeSG) -> None:
+    def test_target_refusal_is_forbidden(
+        self, fake_sg: FakeSG, caplog: pytest.LogCaptureFixture
+    ) -> None:
         _enable_session_user(fake_sg)
         fake_sg.rpc_sudo_mint_failures[('usersvc', _LOGIN)] = {
             'exception': True,
-            'message': "Cannot 'sudo' - inactive user account: 'jane.exec'",
+            'message': "Cannot 'sudo' - inactive user account: 'jane.exec' (svc-credential)",
             'error_code': 102,
         }
-        with pytest.raises(_ForbiddenError):
+        with caplog.at_level(logging.INFO, logger=_AUDIT_LOGGER), pytest.raises(_ForbiddenError):
             _make_service(fake_sg, token_types=_SESSION_TYPES).issue_token(
                 _make_request(token_type=_SESSION_TYPE)
             )
+        detail = json.loads(caplog.records[-1].getMessage())['detail']
+        assert 'RPC 102' in detail
+        assert 'session token request' in detail
+        assert 'svc-credential' not in caplog.text
 
     @pytest.mark.parametrize(
         ('kind', 'expected'),
@@ -429,6 +462,36 @@ def _sudo_mint_count(fake_sg: FakeSG) -> int:
     )
 
 
+def test_directory_transport_failure_protects_bearer(
+    offline_sg: FakeSG, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bearer = 'synthetic-directory-credential'
+    service = _make_service(offline_sg)
+    monkeypatch.setattr(service._directory, '_lookup_bearer', Mock(return_value=bearer))
+    get = Mock(side_effect=OSError(f'lookup failed using {bearer}'))
+    monkeypatch.setattr(service._directory._session, 'get', get)
+    with (
+        caplog.at_level(logging.INFO, logger=_AUDIT_LOGGER),
+        pytest.raises(UserTokenError) as caught,
+    ):
+        service.issue_token(_make_request())
+    record = json.loads(caplog.records[-1].getMessage())
+    assert record['reason'] == 'upstream_unavailable'
+    assert record['detail'] == 'SG user lookup could not be sent: OSError'
+    assert bearer not in caplog.text
+    assert bearer not in ''.join(traceback.format_exception(caught.value))
+
+
 def test_service_account_repr_omits_script_key() -> None:
     account = ServiceAccount('https://studio.example', 'service-script', 'secret-key-value')
     assert 'secret-key-value' not in repr(account)
+
+
+def test_target_denial_uses_local_diagnosis() -> None:
+    title = 'Cannot sudo as inactive user'
+    response = Mock(status_code=401, json=Mock(return_value={'errors': [{'title': title}]}))
+    minter = SGMinter('https://sg.example', session=Mock(post=Mock(return_value=response)))
+    with pytest.raises(SGError) as caught:
+        minter.mint_rest_token('script', 'sudo', scope='sudo_as_login:inactive')
+    assert 'sudo' not in str(caught.value)
+    assert isinstance(_usertoken._map_mint_error(caught.value), _ForbiddenError)

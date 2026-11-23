@@ -31,6 +31,9 @@ htmlcov/
 .pytest_cache/
 .cache/
 
+# Farm benchmark artifacts
+/bench-results/
+
 # Type checker / linter caches
 .pyright/
 .mypy_cache/

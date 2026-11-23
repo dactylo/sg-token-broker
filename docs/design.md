@@ -1,8 +1,9 @@
 # Design and security boundaries
 
 sg-token-broker keeps SG script keys in a service instead of distributing them to every tool. It
-centralizes token issuance, limits which SG identities each caller can use, and records each
-issuance in an audit log. SG remains responsible for enforcing each identity's permissions.
+centralizes token issuance and limits which SG identities each caller can use. Before sending a
+token, the service attempts to write and flush the issuance record. The log destination controls
+retention. SG remains responsible for enforcing each identity's permissions.
 
 This page explains how the two services decide what to issue and where their protection stops. To
 choose a service, read [Choosing a credential](modes.md); to try one, start with the
@@ -13,9 +14,10 @@ choose a service, read [Choosing a credential](modes.md); to try one, start with
 ### App-token broker
 
 A tool presents its broker client ID and secret with HTTP Basic authentication and names a scope.
-The broker verifies the secret against its stored hash, applies the client's per-minute rate limit,
-checks the client's scope and token-type allowlists, and returns an SG token for the scope's script
-account. SG sees that script account as the caller.
+The broker verifies the secret and checks the client's scope and token-type allowlists on every
+request. It returns a cached token if it can. Only a new token request to SG spends the client's
+per-minute allowance, including an attempt that SG refuses. Callers waiting for the same token
+share that request. SG sees the scope's script account as the caller.
 
 Give each scope a suitably limited SG script account: a scope named `read_all` is read-only only if
 its account is. Separate client credentials let you revoke one consuming system without affecting

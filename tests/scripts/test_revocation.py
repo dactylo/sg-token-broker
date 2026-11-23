@@ -9,6 +9,13 @@ from unittest.mock import Mock
 import pytest
 import requests
 
+from tests._revocation import (
+    ISSUED_SESSION,
+    REPLACEMENT_KEY,
+    assert_operator_steps,
+    assert_replacement_procedure,
+    assert_restore_reminder,
+)
 from tests.conftest import FakeSG
 from tests.scripts._helpers import load_script as _load_path
 
@@ -171,23 +178,6 @@ class TestStandaloneScript:
         assert 'Cannot authenticate' not in streams.err
         assert 'error_shape' in streams.err
 
-    @pytest.mark.parametrize(
-        ('nested_results', 'session_id'),
-        [(False, ''), (False, '  \t'), (True, ''), (True, '  \t')],
-    )
-    def test_blank_session_id_is_inconclusive(
-        self,
-        fake_sg: FakeSG,
-        nested_results: bool,
-        session_id: str,
-    ) -> None:
-        module = _load_script()
-        fake_sg.nested_results = nested_results
-        fake_sg.rpc_session_id_override = session_id
-        session = module._build_session(proxy=None, ca_bundle=None, insecure=False)
-        with pytest.raises(RuntimeError, match='session_id'):
-            module._check_session_token(session, fake_sg.url, fake_sg.canned_session)
-
     def test_diagnostics_never_echo_the_body(self, fake_sg: FakeSG) -> None:
         module = _load_script()
         fake_sg.nested_results = True
@@ -266,21 +256,6 @@ class TestStandaloneScript:
         assert 'HTTP 503' in message
         assert fake_sg.canned_session not in message
         assert 'no_session_id' in message
-
-    @pytest.mark.parametrize('nested_results', [False, True])
-    def test_mint_preserves_nonempty_session_id(
-        self,
-        fake_sg: FakeSG,
-        nested_results: bool,
-    ) -> None:
-        module = _load_script()
-        expected = '  padded-token  '
-        fake_sg.nested_results = nested_results
-        fake_sg.rpc_session_id_override = expected
-        session = module._build_session(proxy=None, ca_bundle=None, insecure=False)
-        token, error = module._mint_session_token(session, fake_sg.url, 's', 'k')
-        assert token == expected
-        assert error == ''
 
     def test_non_auth_fault_is_inconclusive_not_pass(
         self,
@@ -379,6 +354,48 @@ class TestStandaloneScript:
             ]
         )
         assert result == 2
+
+    @pytest.mark.parametrize(('status', 'expected'), [(200, 173), (403, None)])
+    def test_rest_lifetime_requires_success(self, status: int, expected: int | None) -> None:
+        session = Mock()
+        session.post.return_value.status_code = status
+        session.post.return_value.json.return_value = {'expires_in': 173}
+        lifetime = _load_script()._rest_token_expires_in(
+            session, 'https://studio.example.com', 's', 'k'
+        )
+        assert lifetime == expected
+
+    @pytest.mark.parametrize(
+        ('nested_results', 'session_id'),
+        [(False, ''), (False, '  \t'), (True, ''), (True, '  \t')],
+    )
+    def test_blank_session_id_is_inconclusive(
+        self,
+        fake_sg: FakeSG,
+        nested_results: bool,
+        session_id: str,
+    ) -> None:
+        module = _load_script()
+        fake_sg.nested_results = nested_results
+        fake_sg.rpc_session_id_override = session_id
+        session = module._build_session(proxy=None, ca_bundle=None, insecure=False)
+        with pytest.raises(RuntimeError, match='session_id'):
+            module._check_session_token(session, fake_sg.url, fake_sg.canned_session)
+
+    @pytest.mark.parametrize('nested_results', [False, True])
+    def test_mint_preserves_nonempty_session_id(
+        self,
+        fake_sg: FakeSG,
+        nested_results: bool,
+    ) -> None:
+        module = _load_script()
+        expected = '  padded-token  '
+        fake_sg.nested_results = nested_results
+        fake_sg.rpc_session_id_override = expected
+        session = module._build_session(proxy=None, ca_bundle=None, insecure=False)
+        token, error = module._mint_session_token(session, fake_sg.url, 's', 'k')
+        assert token == expected
+        assert error == ''
 
     def test_restore_instructions_survive_a_crash_after_disable(
         self,
@@ -569,6 +586,39 @@ class TestStandaloneTranscript:
             'warning: TLS verification disabled; only use with a disposable script key\n'
         )
 
+    @pytest.mark.parametrize('survives', [False, True], ids=['retired', 'survived'])
+    def test_replacement_outcome(
+        self,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        survives: bool,
+    ) -> None:
+        module = _load_script()
+        monkeypatch.setenv('SGTB_VERIFY_KEY', 'masterkey')
+        prompts = _script_site(monkeypatch, module, [True, True, False, True, survives])
+        result = module._main(_ARGS)
+        streams = capsys.readouterr()
+        out = streams.out.lower()
+        assert_operator_steps(prompts, 4, replacement_key=not survives)
+        assert 'works again' in out
+        assert 'only suspends' in out
+        if survives:
+            assert result == 1
+            assert 'still alive' in out
+            assert 'renamed and trashed' in out
+            assert 'retirement procedure verified' not in out
+            assert 'reassess issuing app-token session tokens' not in out
+            assert_restore_reminder(out, after='still alive')
+        else:
+            assert result == 0
+            assert REPLACEMENT_KEY not in streams.out + streams.err
+            assert all(REPLACEMENT_KEY not in prompt for prompt in prompts)
+            assert 'dead while the renamed original stays trashed' in out
+            assert 'replacement script mints under the original name' in out
+            assert_replacement_procedure(out, 'retirement procedure verified')
+            assert_restore_reminder(out, after='retirement procedure verified')
+
     def test_sg_failure_after_the_first_mint_is_inconclusive(
         self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -592,28 +642,19 @@ class TestStandaloneTranscript:
         monkeypatch.setenv('SGTB_VERIFY_KEY', 'masterkey')
         prompts = _script_site(monkeypatch, module, [True, True, True])
         assert module._main(_ARGS) == 1
-        fingerprint = hashlib.sha256(b'live-session').hexdigest()[:16]
-        assert capsys.readouterr().out.splitlines() == [
-            f'Minted a live session token (fingerprint {fingerprint}).',
-            'Note: REST access tokens on this site expire in 600s (site pref).',
-            'Result: the outstanding session token SURVIVED key rotation.',
-            'Failed: the session token survived BOTH key rotation and ApiUser disable.',
-            (
-                'Outstanding tokens can only age out via the site session expiry (sliding - '
-                'indefinite while in use). Reassess issuing app-token session tokens on this site.'
-            ),
-            (
-                "Restore: the ApiUser 's' may still be disabled or trashed - restore it "
-                '(SG Admin > Scripts) unless you intend to leave it retired.'
-            ),
-        ]
-        assert prompts == [
-            (
-                "Step 1: In SG Admin > Scripts, regenerate the application key for 's', "
-                'then press Enter... '
-            ),
-            "Step 2: Now disable/trash the ApiUser 's' (SG Admin > Scripts), then press Enter... ",
-        ]
+        fingerprint = hashlib.sha256(ISSUED_SESSION.encode()).hexdigest()[:16]
+        out = capsys.readouterr().out.lower()
+        assert fingerprint in out
+        assert ISSUED_SESSION not in out
+        assert 'rest access tokens' in out
+        assert '600s' in out
+        assert 'survived key rotation' in out
+        assert 'survived both key rotation and apiuser disable' in out
+        assert 'site session expiry' in out
+        assert 'indefinite while in use' in out
+        assert 'reassess issuing app-token session tokens' in out
+        assert_restore_reminder(out, after='reassess issuing app-token session tokens')
+        assert_operator_steps(prompts, 2)
 
     def test_tls_mint_transport_error_is_one_safe_stderr_line(
         self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
@@ -640,37 +681,6 @@ class TestStandaloneTranscript:
         assert '--insecure' in streams.err
         assert not streams.err.rstrip('\n').endswith('.')
 
-    def test_verified_replacement_names_the_full_procedure(
-        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        module = _load_script()
-        monkeypatch.setenv('SGTB_VERIFY_KEY', 'masterkey')
-        prompts = _script_site(monkeypatch, module, [True, True, False, True, False])
-        assert module._main(_ARGS) == 0
-        assert capsys.readouterr().out.splitlines()[-6:] == [
-            'Caution: the old session token WORKS AGAIN after the script is restored.',
-            'Disabling only suspends tokens; it does not retire them.',
-            'Passed: the old token is dead while the renamed original stays trashed.',
-            'Passed: the replacement script mints under the original name.',
-            (
-                'Retirement procedure verified: rotate the key, rename the script, trash it '
-                'permanently; replace it with a new script reusing the original name.'
-            ),
-            (
-                "Restore: the ApiUser 's' may still be disabled or trashed - restore it "
-                '(SG Admin > Scripts) unless you intend to leave it retired.'
-            ),
-        ]
-        assert prompts[2:] == [
-            "Step 3: Now restore/re-enable the ApiUser 's', then press Enter... ",
-            (
-                'Step 4 (optional): verify the replacement retirement procedure: rotate the key, '
-                'RENAME this script (e.g. s-retired), trash it, then create a NEW script with the '
-                "ORIGINAL name 's' and a fresh key. Type y + Enter when done (anything else to "
-                'skip)... '
-            ),
-        ]
-
 
 def _load_script() -> ModuleType:
     return _load_path(_SCRIPT_PATH)
@@ -687,11 +697,12 @@ def _script_site(
         _session: object, _site_url: str, _script_name: str, script_key: str
     ) -> tuple[str | None, str]:
         mints.append(script_key)
-        if len(mints) == 1 or script_key == 'replacement-key':
-            return 'live-session', ''
+        if len(mints) == 1 or script_key == REPLACEMENT_KEY:
+            return ISSUED_SESSION, ''
         return None, 'SG error (HTTP 200); classification: error_shape; keys present: exception'
 
-    def check(_session: object, _site_url: str, _token: str) -> bool:
+    def check(_session: object, _site_url: str, token: str) -> bool:
+        assert token == ISSUED_SESSION
         return checks.pop(0)
 
     def expires(*_args: object) -> int:
@@ -699,10 +710,11 @@ def _script_site(
 
     def answer(prompt: str) -> str:
         prompts.append(prompt)
-        return 'y' if prompt.startswith('Step 4') else ''
+        return 'y' if 'replacement' in prompt.lower() else ''
 
-    def replacement_key(_prompt: str) -> str:
-        return 'replacement-key'
+    def replacement_key(prompt: str) -> str:
+        prompts.append(prompt)
+        return REPLACEMENT_KEY
 
     monkeypatch.setattr(module, '_mint_session_token', mint)
     monkeypatch.setattr(module, '_check_session_token', check)

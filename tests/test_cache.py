@@ -1,6 +1,7 @@
+import sys
 import threading
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TypeVar
 
 import pytest
@@ -14,10 +15,10 @@ class TestTTLCache:
     def test_concurrent_revalidate_mints_at_most_once(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cache: TTLCache[str] = TTLCache()
+        cache: TTLCache[str] = TTLCache(clock=lambda: 0.0)
         release_validation = threading.Event()
-        validation_started = threading.Event()
-        waiter_lookup = threading.Event()
+        validation_started = _WorkerSignal()
+        waiter_lookup = _WorkerSignal()
         waiter_started = threading.Event()
         observed_flights = _make_observed_flights(waiter_started, waiter_lookup)
         monkeypatch.setattr(cache, '_in_flight', observed_flights)
@@ -26,7 +27,7 @@ class TestTTLCache:
 
         def validate(_value: str) -> bool:
             validation_started.set()
-            release_validation.wait(timeout=5)
+            release_validation.wait()
             return False
 
         def refresh() -> tuple[str, bool]:
@@ -36,17 +37,19 @@ class TestTTLCache:
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             owner = pool.submit(refresh)
-            assert validation_started.wait(timeout=5)
-            waiter_started.set()
-            waiter = pool.submit(refresh)
-            assert waiter_lookup.wait(timeout=5)
-            release_validation.set()
+            try:
+                _wait_for_future_signal(validation_started, owner)
+                waiter_started.set()
+                waiter = pool.submit(refresh)
+                _wait_for_future_signal(waiter_lookup, waiter)
+            finally:
+                release_validation.set()
             results = [owner.result(), waiter.result()]
         assert len(mints) == 1
         assert results == [('new', False), ('new', False)]  # waiters see the owner's outcome
 
     def test_distinct_keys(self) -> None:
-        cache: TTLCache[str] = TTLCache()
+        cache: TTLCache[str] = TTLCache(clock=lambda: 0.0)
         assert cache.get_or_create('a', 60.0, lambda: 'va')[0] == 'va'
         assert cache.get_or_create('b', 60.0, lambda: 'vb')[0] == 'vb'
 
@@ -96,7 +99,7 @@ class TestTTLCache:
         assert (value, hit) == ('b', False)
 
     def test_factory_error_not_cached(self) -> None:
-        cache: TTLCache[str] = TTLCache()
+        cache: TTLCache[str] = TTLCache(clock=lambda: 0.0)
 
         def boom() -> str:
             raise RuntimeError('mint failed')
@@ -107,7 +110,7 @@ class TestTTLCache:
         assert (value, hit) == ('ok', False)
 
     def test_failed_replacement_evicts_the_dead_value(self) -> None:
-        cache: TTLCache[str] = TTLCache()
+        cache: TTLCache[str] = TTLCache(clock=lambda: 0.0)
         cache.get_or_create('k', 60.0, lambda: 'dead')
 
         def explode() -> str:
@@ -120,10 +123,10 @@ class TestTTLCache:
     def test_failing_factory_runs_once_for_concurrent_waiters(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cache: TTLCache[str] = TTLCache()
+        cache: TTLCache[str] = TTLCache(clock=lambda: 0.0)
         calls: list[int] = []
-        factory_entered = threading.Event()
-        racer_lookup = threading.Event()
+        factory_entered = _WorkerSignal()
+        racer_lookup = _WorkerSignal()
         racer_started = threading.Event()
         release_factory = threading.Event()
         release_last_waiter = threading.Event()
@@ -136,7 +139,7 @@ class TestTTLCache:
         def failing_factory() -> str:
             calls.append(1)
             factory_entered.set()
-            assert release_factory.wait(timeout=5)
+            release_factory.wait()
             raise RuntimeError('mint failed')
 
         errors: list[BaseException] = []
@@ -148,31 +151,32 @@ class TestTTLCache:
                 errors.append(exc)
 
         def delayed_worker() -> None:
-            assert release_last_waiter.wait(timeout=5)
+            release_last_waiter.wait()
             worker()
 
-        threads: list[threading.Thread] = []
+        threads: list[_ObservedThread] = []
         try:
-            owner = threading.Thread(target=worker)
+            owner = _ObservedThread(target=worker, signals=(factory_entered, racer_lookup))
             owner.start()
             threads.append(owner)
-            assert factory_entered.wait(timeout=5)
+            factory_entered.wait_for_worker()
             racer_started.set()
-            last_waiter = threading.Thread(target=delayed_worker)
+            last_waiter = _ObservedThread(target=delayed_worker, signals=(racer_lookup,))
             last_waiter.start()
             threads.append(last_waiter)
             for _ in range(3):
-                waiter = threading.Thread(target=worker)
+                waiter = _ObservedThread(target=worker, signals=(racer_lookup,))
                 waiter.start()
                 threads.append(waiter)
             release_last_waiter.set()
-            assert racer_lookup.wait(timeout=5)
+            racer_lookup.wait_for_worker()
         finally:
             release_last_waiter.set()
             release_factory.set()
             for thread in threads:
-                thread.join(timeout=10)
-            assert all(not thread.is_alive() for thread in threads)
+                thread.join()
+            for thread in threads:
+                thread.raise_if_failed()
         assert len(calls) == 1
         assert len(errors) == 5
         assert len({id(error) for error in errors}) == 1
@@ -181,10 +185,10 @@ class TestTTLCache:
     def test_failing_flight_remains_visible_until_failure_published(
         self, monkeypatch: pytest.MonkeyPatch, entry_point: str
     ) -> None:
-        cache: TTLCache[str] = TTLCache()
-        completion_started = threading.Event()
-        factory_entered = threading.Event()
-        racer_lookup = threading.Event()
+        cache: TTLCache[str] = TTLCache(clock=lambda: 0.0)
+        completion_started = _WorkerSignal()
+        factory_entered = _WorkerSignal()
+        racer_lookup = _WorkerSignal()
         racer_started = threading.Event()
         release_completion = threading.Event()
         release_factory = threading.Event()
@@ -200,35 +204,39 @@ class TestTTLCache:
 
         def failing_factory() -> str:
             factory_entered.set()
-            release_factory.wait(timeout=5)
+            release_factory.wait()
             raise failure
 
         def unexpected_factory() -> str:
             unexpected_calls.append(1)
             return 'unexpected'
 
-        owner_thread = threading.Thread(
+        owner_thread = _ObservedThread(
             target=_capture_cache_call,
             args=(cache, entry_point, failing_factory, results, errors),
+            signals=(factory_entered, completion_started),
         )
-        owner_thread.start()
-        assert factory_entered.wait(timeout=5)
-        release_factory.set()
-        assert completion_started.wait(timeout=5)
-
-        racer_started.set()
-        racer_thread = threading.Thread(
+        racer_thread = _ObservedThread(
             target=_capture_cache_call,
             args=(cache, entry_point, unexpected_factory, results, errors),
+            signals=(racer_lookup,),
         )
-        racer_thread.start()
-        assert racer_lookup.wait(timeout=5)
-        release_completion.set()
-
-        owner_thread.join(timeout=5)
-        racer_thread.join(timeout=5)
-        assert not owner_thread.is_alive()
-        assert not racer_thread.is_alive()
+        owner_thread.start()
+        try:
+            factory_entered.wait_for_worker()
+            release_factory.set()
+            completion_started.wait_for_worker()
+            racer_started.set()
+            racer_thread.start()
+            racer_lookup.wait_for_worker()
+        finally:
+            release_factory.set()
+            release_completion.set()
+            owner_thread.join()
+            if racer_thread.ident is not None:
+                racer_thread.join()
+        owner_thread.raise_if_failed()
+        racer_thread.raise_if_failed()
         assert unexpected_calls == []
         assert results == []
         assert len(errors) == 2
@@ -240,11 +248,11 @@ class TestTTLCache:
     def test_get_or_create_waits_for_concurrent_revalidation(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cache: TTLCache[str] = TTLCache()
+        cache: TTLCache[str] = TTLCache(clock=lambda: 0.0)
         cache.get_or_create('k', 60.0, lambda: 'dead')
         release_validation = threading.Event()
-        validation_started = threading.Event()
-        waiter_lookup = threading.Event()
+        validation_started = _WorkerSignal()
+        waiter_lookup = _WorkerSignal()
         waiter_started = threading.Event()
         monkeypatch.setattr(
             cache, '_in_flight', _make_observed_flights(waiter_started, waiter_lookup)
@@ -252,7 +260,7 @@ class TestTTLCache:
 
         def validate(_value: str) -> bool:
             validation_started.set()
-            assert release_validation.wait(timeout=5)
+            release_validation.wait()
             return False
 
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -263,11 +271,11 @@ class TestTTLCache:
                 validate,
                 lambda: 'fresh',
             )
-            assert validation_started.wait(timeout=5)
+            _wait_for_future_signal(validation_started, owner)
             waiter_started.set()
             waiter = pool.submit(cache.get_or_create, 'k', 60.0, lambda: 'unexpected')
             try:
-                assert waiter_lookup.wait(timeout=1)
+                _wait_for_future_signal(waiter_lookup, waiter)
                 assert not waiter.done()
             finally:
                 release_validation.set()
@@ -275,7 +283,7 @@ class TestTTLCache:
             assert waiter.result() == ('fresh', True)
 
     def test_miss_then_hit(self) -> None:
-        cache: TTLCache[str] = TTLCache()
+        cache: TTLCache[str] = TTLCache(clock=lambda: 0.0)
         calls: list[int] = []
 
         def factory() -> str:
@@ -291,10 +299,10 @@ class TestTTLCache:
     def test_revalidate_joining_concurrent_creation_reports_not_kept(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cache: TTLCache[str] = TTLCache()
-        factory_started = threading.Event()
+        cache: TTLCache[str] = TTLCache(clock=lambda: 0.0)
+        factory_started = _WorkerSignal()
         release_factory = threading.Event()
-        waiter_lookup = threading.Event()
+        waiter_lookup = _WorkerSignal()
         waiter_started = threading.Event()
         monkeypatch.setattr(
             cache, '_in_flight', _make_observed_flights(waiter_started, waiter_lookup)
@@ -302,13 +310,13 @@ class TestTTLCache:
 
         def factory() -> str:
             factory_started.set()
-            assert release_factory.wait(timeout=5)
+            release_factory.wait()
             return 'fresh'
 
         validations: list[str] = []
         with ThreadPoolExecutor(max_workers=2) as pool:
             owner = pool.submit(cache.get_or_create, 'k', 60.0, factory)
-            assert factory_started.wait(timeout=5)
+            _wait_for_future_signal(factory_started, owner)
             waiter_started.set()
             waiter = pool.submit(
                 cache.revalidate_or_replace,
@@ -318,7 +326,7 @@ class TestTTLCache:
                 lambda: 'unexpected',
             )
             try:
-                assert waiter_lookup.wait(timeout=5)
+                _wait_for_future_signal(waiter_lookup, waiter)
             finally:
                 release_factory.set()
             assert owner.result() == ('fresh', False)
@@ -336,25 +344,25 @@ class TestTTLCache:
         assert cache.get_or_create('k', 60.0, lambda: 'new') == ('new', False)
 
     def test_revalidate_replaces_dead_value(self) -> None:
-        cache: TTLCache[str] = TTLCache()
+        cache: TTLCache[str] = TTLCache(clock=lambda: 0.0)
         cache.get_or_create('k', 60.0, lambda: 'old')
         value, kept = cache.revalidate_or_replace('k', 60.0, lambda _: False, lambda: 'new')
         assert (value, kept) == ('new', False)
         assert cache.get_or_create('k', 60.0, lambda: 'unused') == ('new', True)
 
     def test_revalidate_with_empty_cache_mints(self) -> None:
-        cache: TTLCache[str] = TTLCache()
+        cache: TTLCache[str] = TTLCache(clock=lambda: 0.0)
         value, kept = cache.revalidate_or_replace('k', 60.0, lambda _: True, lambda: 'new')
         assert (value, kept) == ('new', False)
 
     def test_singleflight_collapses_concurrent_misses(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cache: TTLCache[str] = TTLCache()
+        cache: TTLCache[str] = TTLCache(clock=lambda: 0.0)
         calls: list[int] = []
-        factory_started = threading.Event()
+        factory_started = _WorkerSignal()
         release_factory = threading.Event()
-        waiter_lookup = threading.Event()
+        waiter_lookup = _WorkerSignal()
         waiter_started = threading.Event()
         monkeypatch.setattr(
             cache, '_in_flight', _make_observed_flights(waiter_started, waiter_lookup)
@@ -363,22 +371,64 @@ class TestTTLCache:
         def factory() -> str:
             calls.append(1)
             factory_started.set()
-            assert release_factory.wait(timeout=5)
+            release_factory.wait()
             return 'tok'
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             owner = pool.submit(cache.get_or_create, 'k', 60.0, factory)
-            assert factory_started.wait(timeout=5)
+            _wait_for_future_signal(factory_started, owner)
             waiter_started.set()
             waiter = pool.submit(cache.get_or_create, 'k', 60.0, factory)
             try:
-                assert waiter_lookup.wait(timeout=5)
+                _wait_for_future_signal(waiter_lookup, waiter)
                 assert not waiter.done()
             finally:
                 release_factory.set()
             assert owner.result() == ('tok', False)
             assert waiter.result() == ('tok', True)
         assert calls == [1]
+
+
+class _WorkerSignal(threading.Event):
+    def __init__(self) -> None:
+        super().__init__()
+        self._reached = False
+
+    def set(self) -> None:
+        self._reached = True
+        super().set()
+
+    def wait_for_worker(self) -> None:
+        self.wait()
+        assert self._reached, 'worker exited before reaching the expected signal'
+
+    def wake_on_exit(self) -> None:
+        super().set()
+
+
+class _ObservedThread(threading.Thread):
+    def __init__(
+        self,
+        *,
+        target: Callable[..., object],
+        signals: tuple[_WorkerSignal, ...],
+        args: tuple[object, ...] = (),
+    ) -> None:
+        super().__init__(target=target, args=args)
+        self._signals = signals
+        self._error: BaseException | None = None
+
+    def raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise self._error
+
+    def run(self) -> None:
+        try:
+            super().run()
+        finally:
+            self._error = sys.exception()
+            for signal in self._signals:
+                signal.wake_on_exit()
 
 
 def _capture_cache_call(
@@ -433,7 +483,7 @@ def _make_test_flight(
     class PausingEvent(threading.Event):
         def set(self) -> None:
             completion_started.set()
-            release_completion.wait(timeout=5)
+            release_completion.wait()
             super().set()
 
     class TestFlight(_InFlight[_T]):
@@ -442,3 +492,10 @@ def _make_test_flight(
             self.done = PausingEvent()
 
     return TestFlight
+
+
+def _wait_for_future_signal(signal: _WorkerSignal, worker: Future[_T]) -> None:
+    worker.add_done_callback(lambda _worker: signal.wake_on_exit())
+    signal.wait_for_worker()
+    if worker.done():
+        worker.result()

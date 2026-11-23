@@ -8,17 +8,20 @@ from sg_token_broker._audit import AuditLogger
 from sg_token_broker._cache import TTLCache
 from sg_token_broker._gclaims import ClaimsError, VerifiedClaims
 from sg_token_broker._secrets import token_fingerprint
-from sg_token_broker._sg import MintedToken, SGError
+from sg_token_broker._sg import (
+    MintedToken,
+    SGError,
+    SGFailureKind,
+    SGInvalidResponseError,
+    classify_sg_failure,
+)
 from sg_token_broker._users import UnknownUserError, UserDirectory, UserLookupError
 
 _DEFAULT_EXPIRES_IN = 600
-_ERR_AUTH_CODE = 102
-_MINTER_FAULT_MARKERS = ("does not have permission to 'sudo'", "can't authenticate script")
 _REST_EXPIRY_MARGIN_SECONDS = 30
 _REST_TYPE = 'rest'
 _SERVER_ERROR_STATUS = 500
 _SESSION_TYPE = 'session'
-_TARGET_REFUSAL_MARKERS = ("cannot 'sudo'", 'cannot sudo as')
 _TOKEN_CACHE_TTL_SECONDS = 120.0
 
 _CachedMint: TypeAlias = tuple[MintedToken, datetime.datetime]
@@ -83,10 +86,12 @@ class UserTokenError(Exception):
     Attributes:
         status: HTTP status returned for the failure.
         error: Error code returned in the response body.
+        retry_after: Seconds to wait before retrying, if specified.
     """
 
     status = 500
     error = 'internal_error'
+    retry_after: float | None = None
 
 
 @dataclass(frozen=True)
@@ -188,11 +193,26 @@ class _UnauthorizedError(UserTokenError):
     error = 'unauthorized'
 
 
-class _UpstreamError(UserTokenError):
-    """SG itself failed; details are logged server-side only."""
+class _SGRejectedError(UserTokenError):
+    """SG refused the upstream request."""
 
     status = 502
-    error = 'upstream_error'
+    error = 'sg_rejected'
+
+
+class _InvalidUpstreamResponseError(UserTokenError):
+    """SG returned a successful response with unusable data."""
+
+    status = 502
+    error = 'sg_invalid_response'
+
+
+class _UpstreamUnavailableError(UserTokenError):
+    """SG could not complete the request and a later retry may succeed."""
+
+    status = 503
+    error = 'upstream_unavailable'
+    retry_after = 1.0
 
 
 class UserTokenService:
@@ -242,7 +262,9 @@ class UserTokenService:
             email=claims.email,
             aud=claims.audience,
             reason=exc.error,
-            detail=str(exc.__cause__ or exc),
+            detail=exc.__cause__.audit_detail
+            if isinstance(exc.__cause__, SGError)
+            else str(exc.__cause__ or exc),
             source_ip=request.source_ip,
             request_id=request.request_id,
             token_type=_audit_token_type(request.token_type),
@@ -261,7 +283,7 @@ class UserTokenService:
             expires_in = _DEFAULT_EXPIRES_IN if minted.expires_in is None else minted.expires_in
             lifetime = expires_in - _REST_EXPIRY_MARGIN_SECONDS
             if lifetime <= _TOKEN_CACHE_TTL_SECONDS:
-                raise _UpstreamError('SG token lifetime too short to serve')
+                raise _InvalidUpstreamResponseError('SG token lifetime too short to serve')
             return minted, _utcnow() + datetime.timedelta(seconds=float(lifetime))
 
         (minted, expires_at), cache_hit = self._cache.get_or_create(
@@ -292,8 +314,10 @@ class UserTokenService:
         def alive(entry: _CachedMint) -> bool:
             try:
                 return self._minter.check_session_token(entry[0].token)
+            except SGInvalidResponseError as exc:
+                raise _InvalidUpstreamResponseError('SG upstream request failed') from exc
             except SGError as exc:
-                raise _UpstreamError('SG upstream request failed') from exc
+                raise _UpstreamUnavailableError('SG upstream request failed') from exc
 
         if refresh:
             (minted, cache_until), kept = self._cache.revalidate_or_replace(
@@ -322,7 +346,9 @@ class UserTokenService:
         except UnknownUserError as exc:
             raise _ForbiddenError('no active SG user for this identity') from exc
         except UserLookupError as exc:
-            raise _UpstreamError('SG upstream request failed') from exc
+            if exc.kind is None:
+                raise UserTokenError('internal error') from exc
+            raise _upstream_error(exc.kind) from exc
 
     def issue_token(self, request: UserTokenRequest) -> _IssuedUserToken:
         """Issue a user-bound token for a verified caller.
@@ -416,26 +442,21 @@ def _audit_token_type(value: str) -> str:
     return value if value in (_REST_TYPE, _SESSION_TYPE) else 'invalid'
 
 
-def _classify_sg_refusal(exc: SGError) -> str:
-    """Classify an SG minting failure as `target`, `minter`, or `unknown`."""
-    if exc.error_code == _ERR_AUTH_CODE:
-        refusal = (exc.rpc_message or '').lower()
-    elif exc.status_code in (400, 401):
-        refusal = (exc.error_title or '').lower()
-    else:
-        refusal = ''
-    if any(marker in refusal for marker in _MINTER_FAULT_MARKERS):
-        return 'minter'
-    if any(marker in refusal for marker in _TARGET_REFUSAL_MARKERS):
-        return 'target'
-    return 'unknown'
+def _upstream_error(kind: SGFailureKind) -> UserTokenError:
+    """Choose the service error for the classified SG failure."""
+    error_type = {
+        'rejected': _SGRejectedError,
+        'invalid_response': _InvalidUpstreamResponseError,
+        'unavailable': _UpstreamUnavailableError,
+    }[kind]
+    return error_type('SG upstream request failed')
 
 
 def _map_mint_error(exc: SGError) -> UserTokenError:
     """Map an SG minting failure to the caller-visible error class."""
-    if _classify_sg_refusal(exc) == 'target':
+    if exc.target_refused:
         return _ForbiddenError('SG refused to issue a token for this user')
-    return _UpstreamError('SG upstream request failed')
+    return _upstream_error(classify_sg_failure(exc))
 
 
 def _utcnow() -> datetime.datetime:

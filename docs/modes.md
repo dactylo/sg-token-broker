@@ -104,10 +104,10 @@ Disabling the person's SG account suspends their tokens. Before offboarding some
 
 ## Desktop and web integration
 
-App-token tools are unattended processes on hosts you control, and they fetch tokens with a
-provisioned client credential. Do not give a client credential to tools that people run on their
-own workstations: anyone who can use the workstation can read it and act as the script account, and
-SG cannot tell those people apart. Give such tools user tokens instead.
+On a workstation, an unattended job can use a broker credential under a dedicated account that
+alone can read it. Give interactive tools user tokens when SG should identify the person. If the
+job and person share an account, the person can also use its broker credential to act as the
+script. See [Replacing script keys in existing code](migrating.md).
 
 Desktop tools that need user tokens sign the person in through the system browser, using the OAuth
 authorization code flow with PKCE and a temporary loopback callback. With the optional `login`

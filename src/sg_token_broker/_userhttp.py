@@ -2,6 +2,7 @@
 
 import ipaddress
 import logging
+from http.client import HTTPMessage
 from http.server import BaseHTTPRequestHandler
 from typing import cast
 from urllib.parse import parse_qs
@@ -12,6 +13,7 @@ from sg_token_broker._httpbase import (
     new_request_id,
     parse_content_length,
     respond,
+    retry_after_headers,
     split_target,
 )
 from sg_token_broker._userconfig import normalize_ip
@@ -30,7 +32,6 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
     server_version = 'sg-user-tokens'
     sys_version = ''
     timeout = _REQUEST_TIMEOUT_SECONDS
-    _access_logger = _LOG
 
     def _has_body(self) -> bool:
         """Return whether the GET request declares a body or invalid framing."""
@@ -64,7 +65,11 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
             return peer_address
         if peer not in cast('_UserTokenHTTPServer', self.server).trusted_proxies:
             return peer_address
-        forwarded = ','.join(self.headers.get_all('X-Forwarded-For') or [])
+        # A request-line or header parse failure can precede a usable header block.
+        headers = getattr(self, 'headers', None)
+        if not isinstance(headers, HTTPMessage):
+            return peer_address
+        forwarded = ','.join(headers.get_all('X-Forwarded-For') or [])
         return forwarded.rsplit(',', 1)[-1].strip() or peer_address
 
     def _deny(self, request_id: str, reason: str, status: int, body: dict[str, object]) -> None:
@@ -109,11 +114,18 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
         try:
             issued = server.service.issue_token(request)
         except UserTokenError as exc:
-            respond(self, exc.status, {'error': exc.error, 'detail': str(exc)})
+            respond(
+                self,
+                exc.status,
+                {'error': exc.error, 'detail': str(exc)},
+                headers=retry_after_headers(exc.retry_after),
+            )
             return
-        except Exception as exc:  # noqa: BLE001 - spec: unexpected errors become an opaque 500
+        except Exception as exc:
             server.service.log_unhandled(request, exc)
-            _LOG.exception('unhandled error issuing user token')
+            self.access_logger.log(
+                logging.ERROR, 'unhandled error issuing user token', exc_info=True
+            )
             respond(self, 500, {'error': 'internal_error', 'detail': 'internal error'})
             return
         respond(
@@ -130,7 +142,7 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
         )
 
     def do_GET(self) -> None:
-        """Route GET requests.
+        """Serve the health check or identity-token exchange and reject invalid GET requests.
 
         Raises:
             OSError: If the HTTP response cannot be written.
@@ -171,7 +183,7 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
 class _UserTokenHTTPServer(BoundedThreadingHTTPServer):
     """Threading HTTP server carrying the user-token service reference."""
 
-    _error_logger = _LOG
+    logger = _LOG
 
     def __init__(
         self,

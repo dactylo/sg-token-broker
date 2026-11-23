@@ -6,8 +6,9 @@ and issues an SG token with the permissions of a configured script account or of
 person.
 
 Use it when farm jobs, pipeline services, desktop tools, or Google Sheets need SG access and you
-want to keep script keys on one host, limit which SG identities each caller can use, and record
-every issuance in an audit log.
+want to keep script keys on one host, limit which SG identities each caller can use, and audit
+token issuance. The services attempt to write and flush each issuance record before sending the
+token. Your log destination controls retention.
 
 This documentation uses SG for Flow Production Tracking, formerly named Shotgun and ShotGrid.
 
@@ -157,6 +158,7 @@ If your administrator already runs the service, start with
 | If you want to...                                              | Read                                                                    |
 | -------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | Choose between app and user tokens, or session and REST tokens | [Choosing a credential](docs/modes.md)                                  |
+| Migrate a tool that holds an SG script key                     | [Replacing script keys in existing code](docs/migrating.md)             |
 | Deploy, operate, or troubleshoot the app-token broker          | [App-token broker deployment](docs/deployment.md)                       |
 | Deploy the user-token service                                  | [User-token service](docs/user-token-service.md)                        |
 | Connect a desktop tool to the user-token service               | [Desktop client setup](docs/user-token-service.md#desktop-client-setup) |

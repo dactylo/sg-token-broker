@@ -10,7 +10,7 @@ requires = [ "editables~=0.3", "hatch-fancy-pypi-readme>=25.1", "hatchling>=1.27
 # ==========================================================
 [project]
 name = "sg-token-broker"
-version = "0.2.0"
+version = "0.3.0"
 description = "Authentication broker for Autodesk Flow Production Tracking"
 keywords = [
   "authentication",
@@ -73,6 +73,7 @@ dev = [
 ]
 test = [
   "pytest",
+  "pytest-timeout",
   "pytest-xdist>=3.2",
 ]
 ci-build = [
@@ -126,6 +127,7 @@ lint.per-file-ignores."tests/**/*.py" = [
   "D",       # No docstrings required in tests
   "PLR2004", # Allow magic values in tests
   "S101",    # Allow asserts in tests
+  "S113",    # Tests wait on in-process servers; pytest-timeout ends hangs
   "S603",    # Allow subprocess calls in tests
   "S607",    # Allow partial executable paths in tests
   "SLF001",  # Tests intentionally inspect and patch private state
@@ -158,6 +160,8 @@ ini_options.pythonpath = [ "src" ]
 ini_options.addopts = [ "-q", "--strict-markers", "--tb=short" ]
 ini_options.markers = [ "slow: marks tests as slow (deselect with '-m \"not slow\"')" ]
 ini_options.faulthandler_timeout = 300
+# Fail a hung test after 15 minutes; tests never wait on time, so only a hang reaches this.
+ini_options.timeout = 900
 
 # ==========================================================
 # Mdformat Configuration (Requires mdformat-pyproject)

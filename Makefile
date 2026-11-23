@@ -108,3 +108,8 @@ quality: format-check lock-check type-check whitespace-check workflow-check
 check: quality test
 
 all: check
+
+BENCH_ARGS ?= --help
+.PHONY: bench
+bench: env-check
+	$(DEV_PYTHON) -m benchmarks.farm $(BENCH_ARGS)

@@ -84,7 +84,11 @@ def _parse_provider(environ: Mapping[str, str]) -> tuple[str, str | None]:
         # verbatim (a trailing slash is significant), never normalized.
         issuer = _require(environ, f'{_ENV_PREFIX}_ISSUER')
         try:
-            require_https_or_loopback(issuer, f'{_ENV_PREFIX}_ISSUER')
+            require_https_or_loopback(
+                issuer,
+                f'{_ENV_PREFIX}_ISSUER',
+                credential_settings='the OAuth client credential settings',
+            )
         except ValueError as exc:
             raise UserConfigError(str(exc)) from exc
     return provider, issuer
@@ -153,7 +157,11 @@ def load_user_token_config(environ: Mapping[str, str]) -> _UserTokenConfig:
         raise UserConfigError(f'PORT is out of range (1-{_MAX_PORT}): {port}')
     site_url = _require(environ, f'{_ENV_PREFIX}_SITE_URL')
     try:
-        require_https_or_loopback(site_url, f'{_ENV_PREFIX}_SITE_URL')
+        require_https_or_loopback(
+            site_url,
+            f'{_ENV_PREFIX}_SITE_URL',
+            credential_settings='SGUT_SCRIPT_NAME and SGUT_SCRIPT_KEY',
+        )
     except ValueError as exc:
         raise UserConfigError(str(exc)) from exc
     raw_types = _require(environ, f'{_ENV_PREFIX}_TOKEN_TYPES')

@@ -3,31 +3,46 @@
 import ipaddress
 import json
 import logging
+import math
 import socket
 import threading
 import uuid
 from collections.abc import Mapping
+from contextlib import suppress
 from email.message import Message
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import cast
 from urllib.parse import SplitResult, urlsplit
 
+from sg_token_broker._servicelog import ServiceWriter
+
+_BUSY_BODY = b'{"error": "server_busy", "detail": "server busy; retry later"}'
+_BUSY_RESPONSE: bytes = (
+    b'HTTP/1.1 503 Service Unavailable\r\n'
+    b'Retry-After: 1\r\n'
+    b'Connection: close\r\n'
+    b'Content-Type: application/json\r\n'
+    b'Content-Length: %d\r\n\r\n%s' % (len(_BUSY_BODY), _BUSY_BODY)
+)
 _MAX_CONCURRENT_REQUESTS = 32
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
     """ThreadingHTTPServer with a hard cap on concurrent worker threads.
 
-    Worker threads are daemons. Connections accepted at capacity are closed
-    without a response. When using inherited `handle_error`, configure
-    `_error_logger` before serving requests.
+    Closing the listener leaves daemon workers to exit with the process.
+    At capacity the server attempts one non-blocking 503 response before
+    closing the connection.
 
     Attributes:
-        _error_logger: Logger receiving unexpected request-handler failures.
+        logger: Destination for request-handler failures.
     """
 
-    daemon_threads = True
-    _error_logger: logging.Logger
+    # Threading registers live workers at startup. No close-time join list is needed.
+    block_on_close = False
+    request_queue_size = 1024
+    logger: logging.Logger | ServiceWriter = logging.getLogger(__name__)
     _worker_slots: threading.BoundedSemaphore
 
     def __init__(
@@ -72,7 +87,7 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             client_address: The client address associated with the request.
         """
         del request
-        self._error_logger.log(
+        self.logger.log(
             logging.ERROR,
             'unhandled error serving request from %s',
             client_address,
@@ -84,9 +99,8 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
     ) -> None:
         """Dispatch one request if a worker slot is free; otherwise close it.
 
-        Never blocks the accept loop: at capacity the accepted connection is
-        shut down and closed without a response, so `shutdown()` is bounded by
-        `serve_forever`'s poll interval regardless of held slots.
+        At capacity, attempt one non-blocking send of a 503 response. A short
+        write or socket error ends the attempt so the accept loop can continue.
 
         Args:
             request: Accepted client connection.
@@ -98,6 +112,10 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             OSError: If closing a rejected connection fails.
         """
         if not self._worker_slots.acquire(blocking=False):
+            if not isinstance(request, tuple):
+                with suppress(OSError):
+                    request.settimeout(0)  # Non-blocking for both plain and TLS sockets.
+                    request.send(_BUSY_RESPONSE)
             self.shutdown_request(request)
             return
         try:
@@ -121,13 +139,18 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             self._worker_slots.release()
 
     def server_activate(self) -> None:
-        """Create the worker-slot semaphore, then activate the socket.
+        """Listen with the burst backlog, falling back to five if refused.
+
+        The operating system may cap the requested backlog.
 
         Raises:
             OSError: If the socket cannot begin listening.
         """
         self._worker_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_REQUESTS)
-        super().server_activate()
+        try:
+            self.socket.listen(self.request_queue_size)
+        except OSError:
+            self.socket.listen(5)
 
 
 class JsonErrorHandler(BaseHTTPRequestHandler):
@@ -135,21 +158,36 @@ class JsonErrorHandler(BaseHTTPRequestHandler):
 
     `BaseHTTPRequestHandler` calls `send_error(501, ...)` when a request's
     method has no `do_*` handler. This override maps that one case to 405 and
-    reports it through `_log_denial`; every other stdlib error is unchanged.
+    reports it through `_log_denial`. Other parser errors keep the stdlib
+    response.
 
-    When using inherited `log_request`, configure `_access_logger` before
-    handling requests. Subclasses may override `_log_denial` to record
-    unsupported-method denials.
+    When using inherited `log_request`, configure the server logger before
+    handling requests. Subclasses may override `_log_denial` to record parser
+    and unsupported-method denials.
 
     Attributes:
-        _access_logger: Logger receiving per-request access records at DEBUG.
+        access_logger: Logger receiving per-request access records at DEBUG.
     """
 
-    _access_logger: logging.Logger
-
     def _log_denial(self, reason: str) -> None:
-        """Record an unsupported-method denial; no-op by default."""
+        """Record a parser or unsupported-method denial; no-op by default."""
         del reason
+
+    @property
+    def access_logger(self) -> logging.Logger | ServiceWriter:
+        """Return the logger selected for this server."""
+        return cast('BoundedThreadingHTTPServer', self.server).logger
+
+    def log_message(self, *args: object, **kwargs: object) -> None:
+        """Route stdlib diagnostics to the service log using only a local status."""
+        del kwargs
+        match args:
+            case ('code %d, message %s', int(code), _):
+                self.access_logger.log(
+                    logging.WARNING, 'HTTP request rejected with status %d', code
+                )
+            case _:
+                self.access_logger.log(logging.WARNING, 'HTTP request handling error')
 
     def log_request(self, code: int | str = '-', size: int | str = '-') -> None:
         """Route per-request access logging into the server's logger.
@@ -158,7 +196,10 @@ class JsonErrorHandler(BaseHTTPRequestHandler):
             code: HTTP response status code.
             size: Response size in bytes.
         """
-        self._access_logger.debug('%s %s %s', self.requestline, code, size)
+        del size
+        self.access_logger.log(
+            logging.DEBUG, 'HTTP response status %s', code if isinstance(code, int) else '-'
+        )
 
     def send_error(
         self, code: int, message: str | None = None, explain: str | None = None
@@ -174,6 +215,7 @@ class JsonErrorHandler(BaseHTTPRequestHandler):
             OSError: If the HTTP response cannot be written.
         """
         if code != HTTPStatus.NOT_IMPLEMENTED:
+            self._log_denial('bad_request')
             super().send_error(code, message, explain)
             return
         self._log_denial('method_not_allowed')
@@ -212,7 +254,13 @@ def parse_content_length(headers: Message) -> int:
         raise ValueError('invalid Content-Length') from exc
 
 
-def respond(handler: BaseHTTPRequestHandler, status: int, body: Mapping[str, object]) -> None:
+def respond(
+    handler: BaseHTTPRequestHandler,
+    status: int,
+    body: Mapping[str, object],
+    *,
+    headers: Mapping[str, str] | None = None,
+) -> None:
     """Send one JSON response and close the connection.
 
     Args:
@@ -220,6 +268,7 @@ def respond(handler: BaseHTTPRequestHandler, status: int, body: Mapping[str, obj
         status: HTTP status code.
         body: JSON-serializable response body. Its bytes are omitted for a HEAD
             request (the headers, including Content-Length, are sent).
+        headers: Additional response headers.
 
     Raises:
         OSError: If the response headers or body cannot be written.
@@ -232,10 +281,18 @@ def respond(handler: BaseHTTPRequestHandler, status: int, body: Mapping[str, obj
     handler.send_header('Pragma', 'no-cache')
     handler.send_header('X-Content-Type-Options', 'nosniff')
     handler.send_header('Connection', 'close')
+    if headers:
+        for name, value in headers.items():
+            handler.send_header(name, value)
     handler.close_connection = True
     handler.end_headers()
     if handler.command != 'HEAD':
         handler.wfile.write(payload)
+
+
+def retry_after_headers(seconds: float | None) -> dict[str, str]:
+    """Return a `Retry-After` header rounded up to whole seconds, or no headers for `None`."""
+    return {} if seconds is None else {'Retry-After': str(math.ceil(seconds))}
 
 
 def split_target(path: str) -> SplitResult:

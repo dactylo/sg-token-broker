@@ -8,8 +8,12 @@ from typing import Protocol, cast
 
 import requests
 
+from sg_token_broker._diagnostics import (
+    local_send_detail,
+    oauth_response_detail,
+)
 from sg_token_broker._gclaims import Verifier
-from sg_token_broker._urlpolicy import require_https_or_loopback
+from sg_token_broker._urlpolicy import endpoint_origin, require_https_or_loopback
 
 ASYMMETRIC_OIDC_ALGORITHMS = frozenset(
     {'ES256', 'ES384', 'ES512', 'EdDSA', 'PS256', 'PS384', 'PS512', 'RS256', 'RS384', 'RS512'}
@@ -18,6 +22,15 @@ _DISCOVERY_PATH = '/.well-known/openid-configuration'
 _HTTP_OK = 200
 _JWKS_REFRESH_INTERVAL_SECONDS = 5.0
 _REQUEST_TIMEOUT_SECONDS = 10.0
+_TOKEN_FAILURES = {
+    'DecodeError': 'invalid token header or payload',
+    'ExpiredSignatureError': 'identity token expired',
+    'InvalidAlgorithmError': 'specified alg value is not allowed',
+    'InvalidIssuerError': 'invalid token issuer',
+    'InvalidSignatureError': 'Signature verification failed',
+    'MissingRequiredClaimError': 'token lacks the required exp claim',
+    'PyJWKClientError': 'no usable signing key',
+}
 
 
 class OidcUnavailableError(Exception):
@@ -171,25 +184,32 @@ class _SigningKeyResolver:
 
 
 def _fetch_json_without_redirects(
-    http: requests.Session, url: str, timeout: float, name: str
+    http: requests.Session, url: str, timeout: float, name: str, issuer: str | None = None
 ) -> dict[str, object]:
     """Fetch a JSON object without redirects; provider failures raise RequestException."""
+    origin = endpoint_origin(issuer or url)
     try:
         response = http.get(url, timeout=timeout, allow_redirects=False)
-    except requests.RequestException:
-        raise
+    except (ValueError, requests.RequestException) as exc:
+        raise _OidcTransportError(f'{name} at {origin} failed: {type(exc).__name__}') from None
     except OSError as exc:
-        raise _OidcTransportError(f'{name} could not be sent: {exc}') from exc
+        detail = local_send_detail(exc, http.verify)
+        raise _OidcTransportError(f'{name} at {origin} could not be sent: {detail}') from None
     if response.is_redirect or response.is_permanent_redirect:
-        raise _OidcTransportError(f'{name} redirect not allowed')
+        raise _OidcTransportError(
+            f'{name} redirect not allowed (HTTP {response.status_code}) at {origin}'
+        )
     if response.status_code != _HTTP_OK:
-        raise _OidcTransportError(f'{name} returned HTTP {response.status_code}')
+        detail = oauth_response_detail(response)
+        raise _OidcTransportError(
+            f'{name} returned HTTP {response.status_code} at {origin}{detail}'
+        )
     try:
         document: object = response.json()
-    except ValueError as exc:
-        raise _OidcTransportError(f'{name} is not JSON') from exc
+    except ValueError:
+        raise _OidcTransportError(f'{name} is not JSON (HTTP 200) at {origin}') from None
     if not isinstance(document, dict):
-        raise _OidcTransportError(f'{name} is not a JSON object')
+        raise _OidcTransportError(f'{name} is not a JSON object (HTTP 200) at {origin}')
     return cast('dict[str, object]', document)
 
 
@@ -240,23 +260,30 @@ def oidc_verifier(
         jwt_module = importlib.import_module('jwt')
     except ImportError as exc:
         raise OidcUnavailableError('PyJWT is not installed; install the [oidc] extra') from exc
-    issuer = require_https_or_loopback(issuer, 'OIDC issuer')
+    issuer = require_https_or_loopback(
+        issuer, 'OIDC issuer', credential_settings='the OAuth client credential settings'
+    )
     http = session if session is not None else requests.Session()
     # The well-known path joins onto the issuer without its trailing slash
     # (OIDC Discovery); the issuer VALUE stays exact for all comparisons.
     fields = _fetch_json_without_redirects(
-        http, f'{issuer.rstrip("/")}{_DISCOVERY_PATH}', timeout, 'OIDC discovery'
+        http, f'{issuer.rstrip("/")}{_DISCOVERY_PATH}', timeout, 'OIDC discovery', issuer
     )
     if fields.get('issuer') != issuer:
-        raise ValueError(f'discovery issuer {fields.get("issuer")!r} != configured {issuer!r}')
+        raise ValueError(
+            f'OIDC discovery for {endpoint_origin(issuer)} returned a different issuer (HTTP 200)'
+        )
     jwks_uri = fields.get('jwks_uri')
     if not isinstance(jwks_uri, str) or not jwks_uri:
         raise ValueError('OIDC discovery document has no jwks_uri')
-    require_https_or_loopback(jwks_uri, 'OIDC jwks_uri')
+    try:
+        require_https_or_loopback(jwks_uri, 'OIDC jwks_uri')
+    except ValueError:
+        raise ValueError('OIDC discovery returned an invalid jwks_uri (HTTP 200)') from None
     jwk_client: _JwkClient = jwt_module.PyJWKClient(jwks_uri, cache_keys=True, timeout=timeout)
 
     def fetch_jwks() -> dict[str, object]:
-        return _fetch_json_without_redirects(http, jwks_uri, timeout, 'OIDC JWKS')
+        return _fetch_json_without_redirects(http, jwks_uri, timeout, 'OIDC JWKS', issuer)
 
     signing_keys = _SigningKeyResolver(jwk_client, cast('_JwtModule', jwt_module), fetch_jwks)
 
@@ -271,8 +298,9 @@ def oidc_verifier(
                 options={'require': ['exp'], 'verify_aud': False},
                 leeway=10,
             )
-        except jwt_module.PyJWTError as exc:
-            raise ValueError(str(exc)) from exc
+        except (jwt_module.PyJWTError, ValueError) as exc:
+            detail = _TOKEN_FAILURES.get(type(exc).__name__, 'identity token verification failed')
+            raise ValueError(detail) from None
         if isinstance(payload, dict):
             return cast('Mapping[str, object]', payload)
         raise ValueError('decoded token payload is not an object')

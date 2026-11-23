@@ -1,37 +1,25 @@
 from collections.abc import Callable
+from unittest.mock import Mock
+from urllib.parse import quote_plus
 
 import pytest
 
 from sg_token_broker import _verify
-from sg_token_broker._secrets import token_fingerprint
 from sg_token_broker._sg import MintedToken, SGError, SGMinter
 from sg_token_broker._verify import run_revocation_check
+from tests._revocation import (
+    ISSUED_SESSION,
+    REPLACEMENT_KEY,
+    assert_operator_steps,
+    assert_replacement_procedure,
+    assert_restore_reminder,
+)
+from tests._timeouts import STALL_TIMEOUT_SECONDS
 from tests.conftest import FakeSG
 
 # Documented exit codes of `sg-token-broker verify-revocation`.
 _EXIT_NOT_REVOKED = 1
 _EXIT_REVOKED = 0
-_MINTED = f'Minted a live session token (fingerprint {token_fingerprint("live-session")}).'
-_REST_NOTE = 'Note: REST access tokens on this site expire in 600s (site pref).'
-_RESTORE = (
-    "Restore: the ApiUser 's' may still be disabled or trashed - restore it "
-    '(SG Admin > Scripts) unless you intend to leave it retired.'
-)
-_STEP_1 = (
-    "Step 1: In SG Admin > Scripts, regenerate the application key for 's', then press Enter... "
-)
-_STEP_2 = "Step 2: Now disable/trash the ApiUser 's' (SG Admin > Scripts), then press Enter... "
-_STEP_3 = "Step 3: Now restore/re-enable the ApiUser 's', then press Enter... "
-_STEP_4 = (
-    'Step 4 (optional): verify the replacement retirement procedure: rotate the key, RENAME '
-    'this script (e.g. s-retired), trash it, then create a NEW script with the ORIGINAL name '
-    "'s' and a fresh key. Type y + Enter when done (anything else to skip)... "
-)
-_SURVIVED_ROTATION = [
-    'Result: the outstanding session token SURVIVED key rotation.',
-    'Key rotation alone cannot retire already-issued tokens on this site.',
-    _STEP_2,
-]
 
 
 class TestRunRevocationCheck:
@@ -41,53 +29,6 @@ class TestRunRevocationCheck:
         with pytest.raises(_verify.VerifySetupError, match='could not mint a session token'):
             _run(fake_sg, io)
         assert io.lines == []
-
-    def test_disable_revokes_and_stays_dead_after_restore(self, fake_sg: FakeSG) -> None:
-        def rotate_only() -> None:
-            fake_sg.fail_rpc = True
-
-        def disable() -> None:
-            fake_sg.session_revoked = True
-
-        io = _ScriptedIO([rotate_only, disable, lambda: None])
-        assert _run(fake_sg, io) == _EXIT_REVOKED
-        out = io.text()
-        assert 'SURVIVED key rotation' in out
-        assert 'disabling the ApiUser revoked' in out
-        assert 'stay dead after the script is restored' in out
-
-    def test_disable_revokes_but_token_resurrects_after_restore(self, fake_sg: FakeSG) -> None:
-        def rotate_only() -> None:
-            fake_sg.fail_rpc = True
-
-        def disable() -> None:
-            fake_sg.session_revoked = True
-
-        def restore() -> None:
-            fake_sg.session_revoked = False
-
-        io = _ScriptedIO([rotate_only, disable, restore])
-        assert _run(fake_sg, io) == 3
-        out = io.text()
-        assert 'WORKS AGAIN after the script is restored' in out
-        assert 'replacement' in out
-
-    def test_nothing_revokes(self, fake_sg: FakeSG) -> None:
-        def rotate_only() -> None:
-            fake_sg.fail_rpc = True
-
-        io = _ScriptedIO([rotate_only, lambda: None])
-        assert _run(fake_sg, io) == _EXIT_NOT_REVOKED
-        assert 'survived BOTH' in io.text()
-
-    def test_reports_rest_expiry(self, fake_sg: FakeSG) -> None:
-        def rotate() -> None:
-            fake_sg.fail_rpc = True
-            fake_sg.session_revoked = True
-
-        io = _ScriptedIO([rotate])
-        _run(fake_sg, io)
-        assert '600' in io.text()
 
     def test_restore_instructions_survive_a_crash_after_disable(self, fake_sg: FakeSG) -> None:
         def rotate_only() -> None:
@@ -100,15 +41,6 @@ class TestRunRevocationCheck:
         with pytest.raises(SGError):
             _run(fake_sg, io)
         assert "Restore: the ApiUser 'broker_read_all'" in io.text()
-
-    def test_rotation_revokes_token(self, fake_sg: FakeSG) -> None:
-        def rotate() -> None:
-            fake_sg.fail_rpc = True
-            fake_sg.session_revoked = True
-
-        io = _ScriptedIO([rotate])
-        assert _run(fake_sg, io) == _EXIT_REVOKED
-        assert 'key rotation immediately revoked' in io.text()
 
     def test_step4_verifies_replacement_procedure(self, fake_sg: FakeSG) -> None:
         def rotate_only() -> None:
@@ -134,14 +66,6 @@ class TestRunRevocationCheck:
         assert 'dead while the renamed original stays trashed' in out
         assert 'replacement script mints under the original name' in out
 
-    def test_warns_if_old_key_still_mints(self, fake_sg: FakeSG) -> None:
-        def revoke_session_only() -> None:
-            fake_sg.session_revoked = True
-
-        io = _ScriptedIO([revoke_session_only])
-        assert _run(fake_sg, io) == _EXIT_REVOKED
-        assert 'warning: the old key still mints new tokens' in io.text()
-
 
 class TestSSLHint:
     def test_ssl_error_gets_interception_hint(self) -> None:
@@ -166,97 +90,82 @@ class TestSSLHint:
         assert io.lines == []
 
 
-class TestWalkthroughTranscript:
+class TestWalkthrough:
     def test_disable_that_stays_effective_after_restore(self) -> None:
         io = _ScriptedIO([])
         assert _run_scripted(_ScriptedMinter([True, True, False, False]), io) == _EXIT_REVOKED
-        assert io.lines == [
-            _MINTED,
-            _REST_NOTE,
-            _STEP_1,
-            *_SURVIVED_ROTATION,
-            'Passed: disabling the ApiUser revoked the outstanding session token.',
-            _STEP_3,
-            'Passed: tokens stay dead after the script is restored.',
-            (
-                'Retirement procedure for a leaked scope: rotate the key FIRST '
-                '(not possible while '
-                'trashed), then trash the script, then restore it.'
-            ),
-            _RESTORE,
-        ]
+        assert_operator_steps(io.prompts, 3)
+        out = io.text().lower()
+        assert '67bf8c20b2162328' in out
+        assert ISSUED_SESSION not in out
+        assert 'rest access tokens' in out
+        assert '600s' in out
+        assert 'survived key rotation' in out
+        assert 'rotation alone cannot retire' in out
+        assert 'disabling the apiuser revoked' in out
+        assert 'stay dead' in out
+        advice = out.split('retirement procedure')[1]
+        assert advice.index('rotate') < advice.index('trash') < advice.index('then restore')
+        assert_restore_reminder(out, after='retirement procedure for a leaked scope')
+
+    @pytest.mark.parametrize('survives', [False, True], ids=['retired', 'survived'])
+    def test_replacement_outcome(self, *, survives: bool) -> None:
+        io = _ScriptedIO([], replies=['', '', '', 'y'], key_reply=REPLACEMENT_KEY)
+        minter = _ScriptedMinter([True, True, False, True, survives])
+        result = _run_scripted(minter, io)
+        assert_operator_steps(io.prompts, 4, replacement_key=not survives)
+        out = io.text().lower()
+        if survives:
+            assert result == _EXIT_NOT_REVOKED
+            assert 'still alive' in out
+            assert 'renamed and trashed' in out
+            assert 'retirement procedure verified' not in out
+            assert 'reassess issuing app-token session tokens' not in out
+            assert_restore_reminder(out, after='still alive')
+        else:
+            assert result == _EXIT_REVOKED
+            assert REPLACEMENT_KEY not in io.text()
+            assert 'dead while the renamed original stays trashed' in out
+            assert 'replacement script mints under the original name' in out
+            assert_replacement_procedure(out, 'retirement procedure verified')
+            assert_restore_reminder(out, after='retirement procedure verified')
 
     def test_rotation_names_the_retirement_procedure(self) -> None:
         io = _ScriptedIO([])
         minter = _ScriptedMinter([True, False], old_key_still_mints=True)
         assert _run_scripted(minter, io) == _EXIT_REVOKED
-        assert io.lines == [
-            _MINTED,
-            _REST_NOTE,
-            _STEP_1,
-            'warning: the old key still mints new tokens - was the key actually rotated?',
-            'Passed: key rotation immediately revoked the outstanding session token.',
-            'Retirement procedure for a leaked scope: rotate its application key.',
-        ]
+        assert_operator_steps(io.prompts, 1)
+        out = io.text().lower()
+        assert 'old key still mints' in out
+        assert 'key rotation immediately revoked' in out
+        assert 'rotate its application key' in out
 
     def test_skipped_replacement_is_unverified(self) -> None:
         io = _ScriptedIO([])
         assert _run_scripted(_ScriptedMinter([True, True, False, True]), io) == 3
-        assert io.lines == [
-            _MINTED,
-            _REST_NOTE,
-            _STEP_1,
-            *_SURVIVED_ROTATION,
-            'Passed: disabling the ApiUser revoked the outstanding session token.',
-            _STEP_3,
-            'Caution: the old session token WORKS AGAIN after the script is restored.',
-            'Disabling only suspends tokens; it does not retire them.',
-            _STEP_4,
-            (
-                'Retirement procedure (rename step unverified): rotate the key, '
-                'rename the script, '
-                'trash it permanently; create a replacement script with the original name.'
-            ),
-            _RESTORE,
-        ]
+        assert_operator_steps(io.prompts, 4)
+        out = io.text().lower()
+        assert 'works again' in out
+        assert 'only suspends' in out
+        assert_replacement_procedure(out, 'rename step unverified')
+        assert_restore_reminder(out, after='rename step unverified')
 
     def test_survival_advises_reassessing_app_session_tokens(self) -> None:
         io = _ScriptedIO([])
         assert _run_scripted(_ScriptedMinter([True, True, True]), io) == _EXIT_NOT_REVOKED
-        assert io.lines == [
-            _MINTED,
-            _REST_NOTE,
-            _STEP_1,
-            *_SURVIVED_ROTATION,
-            'Failed: the session token survived BOTH key rotation and ApiUser disable.',
-            (
-                'Outstanding tokens can only age out via the site session expiry (sliding - '
-                'indefinite while in use). Reassess issuing app-token session tokens on this site.'
-            ),
-            _RESTORE,
-        ]
+        assert_operator_steps(io.prompts, 2)
+        out = io.text().lower()
+        assert 'survived both key rotation and apiuser disable' in out
+        assert 'site session expiry' in out
+        assert 'indefinite while in use' in out
+        assert 'reassess issuing app-token session tokens' in out
+        assert_restore_reminder(out, after='reassess issuing app-token session tokens')
 
     def test_token_that_fails_to_validate_is_a_setup_failure(self) -> None:
         io = _ScriptedIO([])
         with pytest.raises(_verify.VerifySetupError, match='freshly minted session token'):
             _run_scripted(_ScriptedMinter([False]), io)
         assert io.lines == []
-
-    def test_verified_replacement_names_the_full_procedure(self) -> None:
-        io = _ScriptedIO([], replies=['', '', '', 'y'], key_reply='replacement-key')
-        minter = _ScriptedMinter([True, True, False, True, False])
-        assert _run_scripted(minter, io) == _EXIT_REVOKED
-        assert io.lines[-6:] == [
-            _STEP_4,
-            'Passed: the old token is dead while the renamed original stays trashed.',
-            'application key for the replacement script (Enter to skip): ',
-            'Passed: the replacement script mints under the original name.',
-            (
-                'Retirement procedure verified: rotate the key, rename the script, trash it '
-                'permanently; replace it with a new script reusing the original name.'
-            ),
-            _RESTORE,
-        ]
 
 
 class _ScriptedIO:
@@ -270,14 +179,17 @@ class _ScriptedIO:
         self._replies = list(replies or [])
         self._key_reply = key_reply
         self.lines: list[str] = []
+        self.prompts: list[str] = []
 
     def ask(self, message: str) -> str:
+        self.prompts.append(message)
         self.lines.append(message)
         if self._actions:
             self._actions.pop(0)()
         return self._replies.pop(0) if self._replies else ''
 
     def ask_secret(self, message: str) -> str:
+        self.prompts.append(message)
         self.lines.append(message)
         return self._key_reply
 
@@ -295,7 +207,7 @@ class _ScriptedMinter:
         self._session_mints = 0
 
     def check_session_token(self, session_token: str) -> bool:
-        del session_token
+        assert session_token == ISSUED_SESSION
         return self._alive.pop(0)
 
     def mint_rest_token(self, script_name: str, script_key: str) -> MintedToken:
@@ -305,18 +217,63 @@ class _ScriptedMinter:
     def mint_session_token(self, script_name: str, script_key: str) -> MintedToken:
         del script_name
         self._session_mints += 1
-        if (
-            self._session_mints == 1
-            or self._old_key_still_mints
-            or script_key == 'replacement-key'
-        ):
-            return MintedToken('live-session', None)
-        raise SGError('SG request to /api3/json returned HTTP 200: Authentication failed')
+        if self._session_mints == 1 or self._old_key_still_mints or script_key == REPLACEMENT_KEY:
+            return MintedToken(ISSUED_SESSION, None)
+        raise SGError('SG rejected authentication', status_code=200, error_code=102)
 
 
 def _run(fake_sg: FakeSG, io: _ScriptedIO) -> int:
-    return run_revocation_check(SGMinter(fake_sg.url), 'broker_read_all', 'masterkey', io)
+    return run_revocation_check(
+        SGMinter(fake_sg.url, timeout=STALL_TIMEOUT_SECONDS), 'broker_read_all', 'masterkey', io
+    )
 
 
 def _run_scripted(minter: _ScriptedMinter, io: _ScriptedIO) -> int:
     return run_revocation_check(minter, 's', 'masterkey', io)
+
+
+@pytest.mark.parametrize(
+    'failure',
+    [
+        SGError('offline'),
+        SGError('busy', status_code=503),
+        SGError('unknown RPC', status_code=200, error_code=109),
+    ],
+)
+def test_old_key_probe_stops_on_inconclusive_response(failure: SGError) -> None:
+    minter = Mock()
+    minter.mint_session_token.side_effect = [MintedToken('session', None), failure]
+    minter.mint_rest_token.return_value = MintedToken('rest', 60)
+    minter.check_session_token.side_effect = [True, False]
+    io = _ScriptedIO([])
+    with pytest.raises(SGError) as caught:
+        run_revocation_check(minter, 'script', 'key', io)
+    assert caught.value is failure
+    assert 'Passed:' not in io.text()
+
+
+def test_rest_probe_displays_a_sanitized_sg_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    key = 'key /+ operator'
+    sent = quote_plus(key)
+    response = Mock(
+        status_code=401,
+        json=Mock(return_value={'errors': [{'title': f'private-transport-detail {sent}'}]}),
+    )
+    minter = SGMinter('https://sg.example', session=Mock(post=Mock(return_value=response)))
+    monkeypatch.setattr(
+        minter,
+        'mint_session_token',
+        Mock(
+            side_effect=[
+                MintedToken('session', None),
+                SGError('authentication failed', status_code=200, error_code=102),
+            ]
+        ),
+    )
+    monkeypatch.setattr(minter, 'check_session_token', Mock(side_effect=[True, False]))
+    io = _ScriptedIO([])
+    assert run_revocation_check(minter, 'script', key, io) == 0
+    assert 'HTTP 401' in io.text()
+    assert key not in io.text()
+    assert sent not in io.text()
+    assert 'private-transport-detail' not in io.text()

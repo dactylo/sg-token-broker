@@ -15,7 +15,6 @@ variables, respectively.
 from sg_token_broker._client import (
     BrokerClient,
     BrokerClientError,
-    ClientOptions,
     TokenResponse,
     fetch_token,
 )
@@ -24,7 +23,6 @@ from sg_token_broker._userclient import UserToken, UserTokenClient, UserTokenCli
 __all__ = [
     'BrokerClient',
     'BrokerClientError',
-    'ClientOptions',
     'TokenResponse',
     'UserToken',
     'UserTokenClient',

@@ -43,19 +43,23 @@ def _load_script() -> ModuleType:
 def _run(
     fake_sg: FakeSG,
     monkeypatch: pytest.MonkeyPatch,
-    actions: list[object],
+    *,
+    on_disable: Callable[[], None] | None = None,
+    on_enable: Callable[[], None] | None = None,
     clock: Callable[[], float] | None = None,
 ) -> int:
     module = _load_script()
     monkeypatch.setenv('SGTB_VERIFY_KEY', 'masterkey')
-    queue = list(actions)
 
     def fake_input(prompt: str) -> str:
-        del prompt
-        if queue:
-            action = queue.pop(0)
-            if callable(action):
-                action()
+        if 'disable the test user' in prompt.lower():
+            action = on_disable
+        elif 're-enable the test user' in prompt.lower():
+            action = on_enable
+        else:
+            raise AssertionError(f'unexpected survey prompt: {prompt}')
+        if action is not None:
+            action()
         return ''
 
     monkeypatch.setattr('builtins.input', fake_input)
@@ -70,7 +74,7 @@ def _run(
             '--sudo-login',
             'tuser',
         ],
-        clock=clock,
+        clock=clock if clock is not None else lambda: 0.0,
     )
 
 
@@ -82,9 +86,21 @@ class TestSudoScript:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         fake_sg.dead_bearers.append(fake_sg.canned_rest)
-        result = _run(fake_sg, monkeypatch, [lambda: None, lambda: None])
+
+        def disable_user() -> None:
+            fake_sg.disabled_login = 'tuser'
+
+        def enable_user() -> None:
+            fake_sg.disabled_login = ''
+            fake_sg.fail_entities_status = 403
+
+        result = _run(fake_sg, monkeypatch, on_disable=disable_user, on_enable=enable_user)
         assert result == 0
         out = capsys.readouterr().out
+        assert 'outstanding sudo token STILL WORKS with the user disabled' in out
+        assert (
+            'after re-enabling the user, SG rejected the outstanding sudo token (HTTP 403)' in out
+        )
         assert 'baseline plain-token project query failed' in out
         assert 'permissions follow the user' not in out
 
@@ -95,7 +111,7 @@ class TestSudoScript:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         fake_sg.bogus_sudo_failure_status = 503
-        result = _run(fake_sg, monkeypatch, [lambda: None, lambda: None])
+        result = _run(fake_sg, monkeypatch)
         assert result == 0
         out = capsys.readouterr().out
         assert 'Inconclusive: the bogus-login mint failed with HTTP 503' in out
@@ -115,7 +131,7 @@ class TestSudoScript:
             fake_sg.disabled_login = ''
             fake_sg.fail_entities_status = 0
 
-        result = _run(fake_sg, monkeypatch, [disable_user, enable_user])
+        result = _run(fake_sg, monkeypatch, on_disable=disable_user, on_enable=enable_user)
         assert result == 3
         out = capsys.readouterr().out
         assert 'Inconclusive: the sudo-token project query failed with HTTP 500' in out
@@ -128,7 +144,7 @@ class TestSudoScript:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         fake_sg.sudo_project_count = 5
-        result = _run(fake_sg, monkeypatch, [lambda: None, lambda: None])
+        result = _run(fake_sg, monkeypatch)
         del result
         assert 'Inconclusive: the project counts match' in capsys.readouterr().out
 
@@ -149,13 +165,27 @@ class TestSudoScript:
         result = _run(
             fake_sg,
             monkeypatch,
-            [disable_user, lambda: None],
+            on_disable=disable_user,
             clock=lambda: now[0],
         )
         out = capsys.readouterr().out
         assert result == 3
         assert 'Inconclusive: the sudo token was rejected' in out
         assert 'elapsed 700s of a 600s lifetime' in out
+
+    def test_failed_mint_discards_success_fields(self) -> None:
+        session = Mock()
+        session.post.return_value.status_code = 403
+        session.post.return_value.json.return_value = {
+            'access_token': 'unusable',
+            'expires_in': 60,
+        }
+        token, lifetime, status, error = _load_script()._mint_rest_token(
+            session, 'https://studio.example.com', 's', 'k', None
+        )
+        assert (token, lifetime, status) == (None, 0, 403)
+        assert '403' in error
+        assert 'unusable' not in error
 
     def test_full_flow_token_dies_on_disable(
         self,
@@ -170,7 +200,7 @@ class TestSudoScript:
         def enable_user() -> None:
             fake_sg.disabled_login = ''
 
-        result = _run(fake_sg, monkeypatch, [disable_user, enable_user])
+        result = _run(fake_sg, monkeypatch, on_disable=disable_user, on_enable=enable_user)
         assert result == 0
         out = capsys.readouterr().out
         assert 'sudo_as_login:tuser' in fake_sg.rest_scopes
@@ -230,27 +260,6 @@ class TestSudoScript:
             'HTTP 403: non-JSON body',
         )
 
-    @pytest.mark.parametrize('status', [400, 401, 403])
-    def test_reenabled_probe_auth_rejection_reports_remains_dead(
-        self,
-        fake_sg: FakeSG,
-        capsys: pytest.CaptureFixture[str],
-        monkeypatch: pytest.MonkeyPatch,
-        status: int,
-    ) -> None:
-        def disable_user() -> None:
-            fake_sg.disabled_login = 'tuser'
-            fake_sg.dead_bearers.append('rest-sudo_as_login:tuser')
-
-        def enable_user() -> None:
-            fake_sg.disabled_login = ''
-            fake_sg.fail_entities_status = status
-
-        result = _run(fake_sg, monkeypatch, [disable_user, enable_user])
-        assert result == 0
-        out = capsys.readouterr().out
-        assert 'after re-enabling the user, the outstanding sudo token remains dead' in out
-
     def test_reenabled_probe_malformed_200_is_inconclusive(
         self,
         fake_sg: FakeSG,
@@ -265,14 +274,14 @@ class TestSudoScript:
             fake_sg.disabled_login = ''
             fake_sg.fail_entities_status = 200
 
-        result = _run(fake_sg, monkeypatch, [disable_user, enable_user])
+        result = _run(fake_sg, monkeypatch, on_disable=disable_user, on_enable=enable_user)
         assert result == 0
         out = capsys.readouterr().out
         assert (
             'Inconclusive: after re-enabling the user, the sudo-token project query failed '
             'with HTTP 200' in out
         )
-        assert 'after re-enabling the user, the outstanding sudo token remains dead' not in out
+        assert 'after re-enabling the user, SG rejected the outstanding sudo token' not in out
 
     def test_reenabled_probe_server_error_is_inconclusive(
         self,
@@ -288,14 +297,71 @@ class TestSudoScript:
             fake_sg.disabled_login = ''
             fake_sg.fail_entities_status = 503
 
-        result = _run(fake_sg, monkeypatch, [disable_user, enable_user])
+        result = _run(fake_sg, monkeypatch, on_disable=disable_user, on_enable=enable_user)
         assert result == 0
         out = capsys.readouterr().out
         assert (
             'Inconclusive: after re-enabling the user, the sudo-token project query failed '
             'with HTTP 503' in out
         )
-        assert 'after re-enabling the user, the outstanding sudo token remains dead' not in out
+        assert 'after re-enabling the user, SG rejected the outstanding sudo token' not in out
+
+    @pytest.mark.parametrize('failed_control', ['plain', 'sudo'])
+    def test_rejection_requires_a_working_pre_disable_control(
+        self,
+        fake_sg: FakeSG,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+        failed_control: str,
+    ) -> None:
+        bearer = 'rest-sudo_as_login:tuser'
+        fake_sg.dead_bearers.append(fake_sg.canned_rest if failed_control == 'plain' else bearer)
+
+        def disable_user() -> None:
+            fake_sg.disabled_login = 'tuser'
+            if failed_control == 'plain':
+                fake_sg.dead_bearers.append(bearer)
+
+        def enable_user() -> None:
+            fake_sg.disabled_login = ''
+            if failed_control == 'plain':
+                fake_sg.dead_bearers.remove(bearer)
+
+        result = _run(fake_sg, monkeypatch, on_disable=disable_user, on_enable=enable_user)
+        out = capsys.readouterr().out
+        assert result == 3
+        assert 'Inconclusive: the sudo token was never observed working before disable' in out
+        assert 'outstanding sudo token died' not in out
+        final_observation = (
+            'SG accepted the outstanding sudo token.'
+            if failed_control == 'plain'
+            else 'SG rejected the outstanding sudo token (HTTP 401).'
+        )
+        assert f'Note: after re-enabling the user, {final_observation}' in out.splitlines()
+
+    @pytest.mark.parametrize('status', [400, 401, 403])
+    def test_reenabled_probe_reports_auth_rejection(
+        self,
+        fake_sg: FakeSG,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+        status: int,
+    ) -> None:
+        def disable_user() -> None:
+            fake_sg.disabled_login = 'tuser'
+            fake_sg.dead_bearers.append('rest-sudo_as_login:tuser')
+
+        def enable_user() -> None:
+            fake_sg.disabled_login = ''
+            fake_sg.fail_entities_status = status
+
+        result = _run(fake_sg, monkeypatch, on_disable=disable_user, on_enable=enable_user)
+        assert result == 0
+        out = capsys.readouterr().out
+        assert (
+            f'after re-enabling the user, SG rejected the outstanding sudo token (HTTP {status})'
+            in out
+        )
 
     def test_remint_5xx_is_inconclusive(
         self,
@@ -310,7 +376,7 @@ class TestSudoScript:
         def restore_mints() -> None:
             fake_sg.fail_rest = False
 
-        result = _run(fake_sg, monkeypatch, [break_mints, restore_mints])
+        result = _run(fake_sg, monkeypatch, on_disable=break_mints, on_enable=restore_mints)
         assert result == 0
         out = capsys.readouterr().out
         assert 'Inconclusive: the sudo remint failed with HTTP 503' in out
@@ -372,7 +438,7 @@ class TestSudoScript:
         def break_site() -> None:
             fake_sg.hard_fail = True
 
-        result = _run(fake_sg, monkeypatch, [break_site])
+        result = _run(fake_sg, monkeypatch, on_disable=break_site)
         assert result == 2
         out = capsys.readouterr().out
         assert "Restore: make sure the test user 'tuser'" in out
@@ -393,24 +459,9 @@ class TestSudoScript:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         fake_sg.disabled_login = 'tuser'
-        result = _run(fake_sg, monkeypatch, [])
+        result = _run(fake_sg, monkeypatch)
         assert result == 2
         assert 'sudo permission' in capsys.readouterr().out
-
-    def test_token_survival_reports_minted_lifetime(
-        self,
-        fake_sg: FakeSG,
-        capsys: pytest.CaptureFixture[str],
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        fake_sg.rest_expires_in = 3600
-
-        def disable_user() -> None:
-            fake_sg.disabled_login = 'tuser'
-
-        result = _run(fake_sg, monkeypatch, [disable_user, lambda: None])
-        assert result == 0
-        assert '(3600s here)' in capsys.readouterr().out
 
     def test_token_survives_disable_reported(
         self,
@@ -418,15 +469,24 @@ class TestSudoScript:
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        fake_sg.rest_expires_in = 3600
+        transitions: list[str] = []
+
         def disable_user() -> None:
             fake_sg.disabled_login = 'tuser'
+            transitions.append(fake_sg.disabled_login)
 
-        result = _run(fake_sg, monkeypatch, [disable_user, lambda: None])
+        def enable_user() -> None:
+            fake_sg.disabled_login = ''
+            transitions.append(fake_sg.disabled_login)
+
+        result = _run(fake_sg, monkeypatch, on_disable=disable_user, on_enable=enable_user)
+        assert transitions == ['tuser', '']
         assert result == 0
         out = capsys.readouterr().out
         assert 'outstanding sudo token STILL WORKS with the user disabled' in out
-        assert 'after re-enabling the user, the outstanding sudo token works again' in out
-        assert 'bounded by the token lifetime (600s here)' in out
+        assert 'after re-enabling the user, SG accepted the outstanding sudo token' in out
+        assert 'bounded by the token lifetime (3600s here)' in out
 
 
 def test_missing_ca_bundle_argument_is_a_usage_error(

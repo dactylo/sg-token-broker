@@ -22,12 +22,16 @@ as long as it is in use.
 A REST token stops working at its hard expiry, and reusing a cached token does not extend that
 expiry. Read the response's `expires_at` instead of assuming a fixed duration: SG sets the
 lifetime, and each service subtracts a safety margin so that callers replace the token before SG
-rejects it. The app-token broker subtracts 60 seconds; the user-token service subtracts 30 seconds.
+rejects it. The app-token broker subtracts 60 seconds and refuses an SG lifetime of 60 seconds or
+less. The user-token service subtracts 30 seconds and also requires the remainder to exceed its
+120-second cache duration.
 
 The user-token service also returns `cache_until`, which equals `expires_at` for REST tokens.
 Because callers never receive an SG refresh token, a replacement always requires a new request to
-the service; a user-token caller must present a current ID token again. The client libraries
-request a replacement 60 seconds before `expires_at`.
+the service; a user-token caller must present a current ID token again. On the next use near
+expiry, the user client requests a replacement within its refresh margin (default 60 seconds). The
+app client spreads its first refresh across the preceding minute. See
+[client tuning and retries](deployment.md#client-tuning-and-retries).
 
 ## Session lifetime and cache hints
 
@@ -54,11 +58,35 @@ directly. Recreate the consuming SG client with the returned token.
 
 ### Replacing a rejected app token
 
-When SG rejects an app token before its `expires_at`, call
-`BrokerClient.fetch_token(scope, token_type, force_refresh=True)`. The client discards its cached
-token and asks the broker again. The broker does not check its own cache with SG: it can return the
-same REST token for up to 60 seconds after minting it, and the same session for
-`defaults.session_ttl_seconds`. If the returned token is the one SG rejected, wait before retrying.
+Keep one `BrokerClient` and call `broker.fetch_token(scope, token_type, rejected_token=t)`, where
+`t` is the exact token SG rejected. Rebuild the SG connection with the returned token. The client
+remembers the eight most recently reported distinct token digests per scope and token type, each
+for 24 hours from its latest report. It sends that history on subsequent requests, including forced
+refreshes. The broker replaces a matching cached token, reuses a different live token, or mints if
+its cache is empty. A failed replacement leaves the rejected entry evicted.
+
+A broker that returns a token named in the report triggers
+`broker returned a token already reported rejected; upgrade every broker to 0.3.0`. With no
+rejection history, `force_refresh=True` discards the local entry and asks again. The broker may
+return the same token.
+
+For shell callers, each invocation starts with no history. Keep the eight most recently rejected
+distinct tokens for this client, scope and type. Supply them on standard input, one per line, for
+example from a file readable only by the job account:
+
+```sh
+sg-token-broker get-token --scope read_all --replace-rejected <rejected-tokens.txt
+```
+
+Blank lines are ignored. Empty input performs an ordinary fetch. More than eight nonblank lines are
+an error. The command refuses interactive input and shows how to redirect it. Never pass token
+values as arguments, which other processes can see. Replacement-mode usage errors omit misplaced
+arguments, and broker errors redact the submitted tokens. Protect the returned JSON as a
+credential.
+
+A retry behind a proxy can reach a different broker process with its own cached token. Recovery is
+guaranteed across up to eight processes. Report each token SG actually rejects and bound the number
+of reads as in the [migration example](migrating.md#recover-a-read-when-sg-rejects-the-session).
 
 ## Revocation
 

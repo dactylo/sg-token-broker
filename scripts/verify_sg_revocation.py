@@ -17,10 +17,9 @@ corporate CA that Python does not trust by default; pass that CA via
 `--ca-bundle` (or the `REQUESTS_CA_BUNDLE` env var), or use `--insecure` to
 skip verification for this one-shot test.
 
-Exit codes: 0 = an immediate retirement procedure exists (output names it),
-1 = outstanding session tokens survive everything, 2 = setup or inconclusive SG
-error,
-3 = the run ended on an unverified step.
+Exit codes: 0 = the run verified an immediate retirement procedure
+(output names it), 1 = the outstanding session token survived the steps tried,
+2 = setup or inconclusive SG error, 3 = the run ended on an unverified step.
 """
 
 import argparse
@@ -145,7 +144,7 @@ def _require_https_or_loopback(url: str) -> str:
 def _rest_token_expires_in(
     session: requests.Session, site_url: str, script_name: str, script_key: str
 ) -> int | None:
-    """Report the site's REST access-token lifetime in seconds, if mintable."""
+    """Read HTTP 200 `expires_in` or return `None`. Local send failures raise `RuntimeError`."""
     try:
         response = session.post(
             f'{site_url.rstrip("/")}{_REST_AUTH_PATH}',
@@ -158,6 +157,8 @@ def _rest_token_expires_in(
             timeout=_TIMEOUT_SECONDS,
             allow_redirects=False,
         )
+        if response.status_code != _HTTP_OK:
+            return None
         data: object = response.json()
     except (requests.RequestException, ValueError):
         return None

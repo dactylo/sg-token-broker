@@ -9,7 +9,14 @@ from typing import Protocol, cast
 import requests
 
 from sg_token_broker._cache import TTLCache
-from sg_token_broker._sg import MintedToken, SGError
+from sg_token_broker._diagnostics import local_send_detail
+from sg_token_broker._sg import (
+    MintedToken,
+    SGError,
+    SGFailureKind,
+    classify_sg_failure,
+    classify_sg_status,
+)
 from sg_token_broker._urlpolicy import require_https_or_loopback
 
 _BEARER_EXPIRY_MARGIN_SECONDS = 30
@@ -24,7 +31,16 @@ class UnknownUserError(Exception):
 
 
 class UserLookupError(Exception):
-    """The SG user lookup could not be completed."""
+    """The SG user lookup could not be completed.
+
+    Attributes:
+        kind: SG failure category, or `None` for a local configuration error.
+    """
+
+    def __init__(self, message: str, *, kind: SGFailureKind | None = None) -> None:
+        """Record the lookup failure and its upstream category."""
+        super().__init__(message)
+        self.kind: SGFailureKind | None = kind
 
 
 class _PlainMinter(Protocol):
@@ -74,7 +90,9 @@ class UserDirectory:
                 insecure.
         """
         try:
-            self._site_url = require_https_or_loopback(site_url, 'SG site URL').rstrip('/')
+            self._site_url = require_https_or_loopback(
+                site_url, 'SG site URL', credential_settings='the SG script name and key settings'
+            ).rstrip('/')
         except ValueError as exc:
             raise UserLookupError(str(exc)) from exc
         self._minter = minter
@@ -95,7 +113,10 @@ class UserDirectory:
             try:
                 minted = self._minter.mint_rest_token(self._script_name, self._script_key)
             except SGError as exc:
-                raise UserLookupError('could not mint the lookup token') from exc
+                raise UserLookupError(
+                    f'could not mint the lookup token: {exc.audit_detail}',
+                    kind=classify_sg_failure(exc),
+                ) from exc
             reuse_for = (minted.expires_in or 0) - _BEARER_EXPIRY_MARGIN_SECONDS
             self._bearer = (minted.token, now + reuse_for) if reuse_for > 0 else None
             return minted.token
@@ -109,10 +130,15 @@ class UserDirectory:
                 headers={'Authorization': f'Bearer {bearer}', 'Accept': 'application/json'},
                 timeout=_REQUEST_TIMEOUT_SECONDS,
             )
-        except requests.RequestException as exc:
-            raise UserLookupError(f'SG user lookup failed: {exc.__class__.__name__}') from exc
+        except (requests.RequestException, ValueError) as exc:
+            raise UserLookupError(
+                f'SG user lookup failed: {exc.__class__.__name__}', kind='unavailable'
+            ) from None
         except OSError as exc:
-            raise UserLookupError(f'SG user lookup could not be sent: {exc}') from exc
+            detail = local_send_detail(exc, self._session.verify)
+            raise UserLookupError(
+                f'SG user lookup could not be sent: {detail}', kind='unavailable'
+            ) from None
 
     def _lookup(self, email: str) -> str:
         """Return the uncached SG login matching `email`."""
@@ -121,11 +147,16 @@ class UserDirectory:
         if response.status_code == HTTPStatus.UNAUTHORIZED:
             response = self._query(email, self._lookup_bearer(rejected=bearer))
         if response.status_code != HTTPStatus.OK:
-            raise UserLookupError(f'SG user lookup returned HTTP {response.status_code}')
+            raise UserLookupError(
+                f'SG user lookup returned HTTP {response.status_code}',
+                kind=classify_sg_status(response.status_code),
+            )
         try:
             body: object = response.json()
-        except ValueError as exc:
-            raise UserLookupError('SG user lookup response was not JSON') from exc
+        except ValueError:
+            raise UserLookupError(
+                'SG user lookup response was not JSON', kind='invalid_response'
+            ) from None
         return _extract_login(body)
 
     def resolve_login(self, email: str) -> str:
@@ -158,20 +189,22 @@ class UserDirectory:
 def _extract_login(body: object) -> str:
     """Pull the single matching login out of a human_users response."""
     if not isinstance(body, dict):
-        raise UserLookupError('SG user lookup response was not a JSON object')
+        raise UserLookupError(
+            'SG user lookup response was not a JSON object', kind='invalid_response'
+        )
     data = cast('dict[str, object]', body).get('data')
     if not isinstance(data, list):
-        raise UserLookupError('SG user lookup response had no data list')
+        raise UserLookupError('SG user lookup response had no data list', kind='invalid_response')
     entries = cast('list[object]', data)
     if len(entries) != 1:
         raise UnknownUserError(f'{len(entries)} SG users match the email')
     entry = entries[0]
     if not isinstance(entry, dict):
-        raise UserLookupError('SG user lookup entry was not an object')
+        raise UserLookupError('SG user lookup entry was not an object', kind='invalid_response')
     attributes = cast('dict[str, object]', entry).get('attributes')
     if not isinstance(attributes, dict):
-        raise UserLookupError('SG user lookup entry had no attributes')
+        raise UserLookupError('SG user lookup entry had no attributes', kind='invalid_response')
     login = cast('dict[str, object]', attributes).get('login')
-    if not isinstance(login, str) or not login:
-        raise UserLookupError('SG user lookup entry had no login')
+    if not isinstance(login, str) or not login.strip():
+        raise UserLookupError('SG user lookup entry had no login', kind='invalid_response')
     return login

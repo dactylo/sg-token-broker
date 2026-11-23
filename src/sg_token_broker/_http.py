@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 import logging
+import re
 import ssl
 from http.server import BaseHTTPRequestHandler
 from typing import cast
@@ -15,6 +16,7 @@ from sg_token_broker._httpbase import (
     new_request_id,
     parse_content_length,
     respond,
+    retry_after_headers,
     split_target,
 )
 from sg_token_broker._service import (
@@ -27,6 +29,7 @@ from sg_token_broker._service import (
 
 _DRAIN_LIMIT_BYTES = 65536
 _MAX_BODY_BYTES = 8192
+_MAX_REJECTED_DIGESTS = 8
 _REQUEST_TIMEOUT_SECONDS = 30
 _SERVER_LOGGER_NAME = 'sg_token_broker.http'
 
@@ -36,7 +39,7 @@ _LOG = logging.getLogger(_SERVER_LOGGER_NAME)
 class _BrokerHTTPServer(BoundedThreadingHTTPServer):
     """Serve broker requests for `service` at `address`."""
 
-    _error_logger = _LOG
+    logger = _LOG
 
     def __init__(self, address: tuple[str, int], service: BrokerService) -> None:
         """Bind `address` and attach the broker service."""
@@ -58,7 +61,6 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
     server_version = 'sg-token-broker'
     sys_version = ''
     timeout = _REQUEST_TIMEOUT_SECONDS
-    _access_logger = _LOG
 
     def _answer_unhandled(self, request_id: str, exc: Exception) -> None:
         """Audit an unexpected token request error and answer opaquely."""
@@ -67,17 +69,27 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
             request_id=request_id,
             exc=exc,
         )
-        _LOG.exception('unhandled error handling token request')
+        self.access_logger.log(
+            logging.ERROR, 'unhandled error handling token request', exc_info=True
+        )
         respond(self, 500, {'error': 'internal_error', 'detail': 'internal error'})
 
-    def _deny(self, request_id: str, reason: str, status: int, body: dict[str, object]) -> None:
+    def _deny(
+        self,
+        request_id: str,
+        reason: str,
+        status: int,
+        body: dict[str, object],
+        *,
+        retry_after: float | None = None,
+    ) -> None:
         """Audit a pre-service denial, then answer it."""
         cast('_BrokerHTTPServer', self.server).service.log_denied_request(
             reason=reason,
             source_ip=self.client_address[0],
             request_id=request_id,
         )
-        respond(self, status, body)
+        respond(self, status, body, headers=retry_after_headers(retry_after))
 
     def _drain(self, length: int) -> None:
         """Discard up to `_DRAIN_LIMIT_BYTES` of a rejected body, best effort."""
@@ -154,6 +166,7 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
             token_type=token_type,
             source_ip=self.client_address[0],
             request_id=request_id,
+            rejected_digests=_rejected_digests(fields.get('rejected_tokens_sha256', [])),
         )
 
     def _read_body(self) -> bytes:
@@ -210,6 +223,7 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
                 exc.reason or 'bad_request',
                 exc.status,
                 {'error': exc.error, 'detail': str(exc)},
+                retry_after=exc.retry_after,
             )
             return
         if path == '/healthz':
@@ -261,6 +275,7 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
                 reason,
                 exc.status,
                 {'error': exc.error, 'detail': str(exc)},
+                retry_after=exc.retry_after,
             )
             return
         except Exception as exc:  # noqa: BLE001 - spec: unexpected errors become an opaque 500
@@ -273,6 +288,7 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
                 self,
                 exc.status,
                 {'error': exc.error, 'detail': str(exc)},
+                headers=retry_after_headers(exc.retry_after),
             )
         except Exception as exc:  # noqa: BLE001 - spec: unexpected errors become an opaque 500
             self._answer_unhandled(request_id, exc)
@@ -288,6 +304,20 @@ class _Handler(JsonErrorHandler, BaseHTTPRequestHandler):
                     'expires_at': issued.expires_at.isoformat(),
                 },
             )
+
+
+def _rejected_digests(value: object) -> frozenset[str]:
+    """Validate the wire list and collapse repeated SHA-256 digests."""
+    if not isinstance(value, list) or len(cast('list[object]', value)) > _MAX_REJECTED_DIGESTS:
+        raise BadRequestError('rejected_tokens_sha256 must be a list of at most 8 digests')
+    digests: set[str] = set()
+    for digest in cast('list[object]', value):
+        if not isinstance(digest, str) or not re.fullmatch('[0-9a-f]{64}', digest):
+            raise BadRequestError(
+                'rejected_tokens_sha256 entries must be 64 lowercase hex characters'
+            )
+        digests.add(digest)
+    return frozenset(digests)
 
 
 def create_server(config: BrokerConfig, service: BrokerService) -> _BrokerHTTPServer:

@@ -4,7 +4,8 @@
 Checks the SG behavior that the user-token service relies on: that a REST
 access token minted with `scope=sudo_as_login:<login>` acts with that user's
 permissions, and what happens to it when the user is disabled. Companion to
-`verify_sg_revocation.py`; same flags, needs only Python 3.11+ and `requests`.
+`verify_sg_revocation.py`, with the same connection options and a required
+`--sudo-login`. It needs only Python 3.11+ and `requests`.
 
 Requirements: the ApiUser (script) used must have a permission rule set with
 "sudo" allowed, and you need a test HumanUser you can safely disable for a
@@ -19,9 +20,9 @@ Usage:
         --proxy http://proxy.example:3128 --ca-bundle /path/to/corp-root-ca.pem
     (single command line; wrapped here for readability)
 
-Exit codes: 0 = the disabled-user check was conclusive (read the other printed
-results), 2 = setup error, 3 = the disabled-user check was inconclusive because
-ordinary expiry could not be ruled out or SG did not answer cleanly.
+Exit 0 means the disabled-user check reached a conclusion. Exit 2 means setup
+failed or a request could not be sent or completed. Exit 3 means the check ran
+but its evidence could not distinguish revocation from another cause.
 """
 
 import argparse
@@ -107,94 +108,21 @@ def _count_projects(
     return None, response.status_code
 
 
-def _check_disabled_user(
-    context: _SurveyContext,
-    mint_sudo: Callable[[], tuple[str | None, int, int, str]],
-    sudo_token: str,
-    *,
-    minted_at: float,
-    expires_in: int,
-) -> str:
-    """Check sudo tokens while the test user is disabled and after re-enabling."""
-    input(
-        f'Step: Disable the test user {context.sudo_login!r} in SG (Admin > People, uncheck '
-        'active / set status), then press Enter... '
-    )
-    disabled_result = 'INCONCLUSIVE'
-    try:
-        remint, _, status, error = mint_sudo()
-        if remint is not None:
-            print('Caution: SG still mints sudo tokens for the disabled user.')
-        elif status in _AUTH_REJECT_STATUSES:
-            print(f'Passed: new sudo mints for the disabled user are rejected ({error}).')
-        else:
-            print(
-                f'Inconclusive: the sudo remint failed with HTTP {status}, which is not a clean '
-                f'rejection ({error}).'
-            )
-        count, status = _count_projects(context.session, context.site_url, sudo_token)
-        elapsed = context.clock() - minted_at
-        window = f'elapsed {elapsed:.0f}s of a {expires_in}s lifetime'
-        if count is not None:
-            disabled_result = 'SURVIVED'
-            print(
-                'Caution: the outstanding sudo token STILL WORKS with the user disabled '
-                f'({window}). Revocation is then bounded by the token lifetime '
-                f'({expires_in}s here), '
-                'not immediate.'
-            )
-        elif status in _AUTH_REJECT_STATUSES and elapsed < expires_in - _EXPIRY_MARGIN_SECONDS:
-            disabled_result = 'PASS'
-            print(
-                'Passed: the outstanding sudo token died when the user was disabled '
-                f'(HTTP {status}; {window}).'
-            )
-        elif status in _AUTH_REJECT_STATUSES:
-            disabled_result = 'INCONCLUSIVE'
-            print(
-                f'Inconclusive: the sudo token was rejected (HTTP {status}) but {window}; '
-                'ordinary expiry cannot be ruled out.'
-            )
-        else:
-            disabled_result = 'INCONCLUSIVE'
-            print(
-                f'Inconclusive: the sudo-token project query failed with HTTP {status} '
-                f'({window}); cannot distinguish revocation from an outage.'
-            )
-        input(f'Step: Re-enable the test user {context.sudo_login!r}, then press Enter... ')
-        count, status = _count_projects(context.session, context.site_url, sudo_token)
-        if count is not None:
-            print('Note: after re-enabling the user, the outstanding sudo token works again.')
-        elif status in _AUTH_REJECT_STATUSES:
-            print('Note: after re-enabling the user, the outstanding sudo token remains dead.')
-        else:
-            print(
-                'Inconclusive: after re-enabling the user, the sudo-token project query failed '
-                f'with HTTP {status}; cannot determine the outstanding token state.'
-            )
-    finally:
-        print(
-            f'Restore: make sure the test user {context.sudo_login!r} is re-enabled in SG '
-            '(Admin > People) before you leave.'
-        )
-    return disabled_result
-
-
 def _compare_project_visibility(
     session: requests.Session, site_url: str, plain_token: str, sudo_token: str
-) -> None:
-    """Compare project visibility between the plain and sudo tokens."""
+) -> bool:
+    """Compare visible project counts and return whether both token reads succeeded."""
     plain_count, plain_status = _count_projects(session, site_url, plain_token)
     if plain_count is None:
         print(
             f'warning: the baseline plain-token project query failed (HTTP {plain_status}); '
             'the permission comparison is inconclusive'
         )
-        return
+        return False
     sudo_count, sudo_status = _count_projects(session, site_url, sudo_token)
     if sudo_count is None:
         print(f'warning: the sudo-token project query failed (HTTP {sudo_status})')
-        return
+        return False
     print(f'plain token sees {plain_count} project(s); sudo token sees {sudo_count}.')
     if plain_count != sudo_count:
         print('Passed: permissions follow the user; the sudo token is user-bound.')
@@ -204,10 +132,11 @@ def _compare_project_visibility(
             'projects as the script, or sudo is not applied. Re-run with a test user who '
             'has restricted project access.'
         )
+    return True
 
 
 def _first_error(fields: dict[str, object]) -> str:
-    """Extract the first error title/detail from a REST error body."""
+    """Use the first REST error detail, title or contents, falling back to the response mapping."""
     errors = fields.get('errors')
     if isinstance(errors, list) and errors:
         first: object = cast('list[object]', errors)[0]
@@ -235,7 +164,7 @@ def _mint_rest_token(
     script_key: str,
     scope: str | None,
 ) -> tuple[str | None, int, int, str]:
-    """Mint a REST access token, optionally with a sudo scope."""
+    """Mint a plain or sudo REST token and accept it only from an HTTP 200 response."""
     form = {
         'grant_type': 'client_credentials',
         'client_id': script_name,
@@ -265,9 +194,98 @@ def _mint_rest_token(
     fields = cast('dict[str, object]', data)
     token = fields.get('access_token')
     expires = fields.get('expires_in')
+    if isinstance(token, str) and status != _HTTP_OK:
+        return None, 0, status, f'HTTP {status}: token mint failed'
     if isinstance(token, str):
         return token, expires if isinstance(expires, int) else 0, status, ''
     return None, 0, status, f'HTTP {status}: {_first_error(fields)}'
+
+
+def _check_disabled_user(
+    context: _SurveyContext,
+    sudo_token: str,
+    *,
+    observed_working: bool,
+    minted_at: float,
+    expires_in: int,
+) -> str:
+    """Credit revocation only when a working sudo token is rejected before its expiry margin."""
+    input(
+        f'Step: Disable the test user {context.sudo_login!r} in SG (Admin > People, uncheck '
+        'active / set status), then press Enter... '
+    )
+    disabled_result = 'INCONCLUSIVE'
+    try:
+        remint, _, status, error = _mint_rest_token(
+            context.session,
+            context.site_url,
+            context.script_name,
+            context.key,
+            f'sudo_as_login:{context.sudo_login}',
+        )
+        if remint is not None:
+            print('Caution: SG still mints sudo tokens for the disabled user.')
+        elif status in _AUTH_REJECT_STATUSES:
+            print(f'Passed: new sudo mints for the disabled user are rejected ({error}).')
+        else:
+            print(
+                f'Inconclusive: the sudo remint failed with HTTP {status}, which is not a clean '
+                f'rejection ({error}).'
+            )
+        count, status = _count_projects(context.session, context.site_url, sudo_token)
+        elapsed = context.clock() - minted_at
+        window = f'elapsed {elapsed:.0f}s of a {expires_in}s lifetime'
+        if count is not None:
+            disabled_result = 'SURVIVED'
+            print(
+                'Caution: the outstanding sudo token STILL WORKS with the user disabled '
+                f'({window}). Revocation is then bounded by the token lifetime '
+                f'({expires_in}s here), '
+                'not immediate.'
+            )
+        elif status in _AUTH_REJECT_STATUSES and not observed_working:
+            print(
+                'Inconclusive: the sudo token was never observed working before disable; '
+                f'its rejection (HTTP {status}) cannot establish revocation.'
+            )
+        elif status in _AUTH_REJECT_STATUSES and elapsed < expires_in - _EXPIRY_MARGIN_SECONDS:
+            disabled_result = 'PASS'
+            print(
+                'Passed: the outstanding sudo token died when the user was disabled '
+                f'(HTTP {status}; {window}).'
+            )
+        elif status in _AUTH_REJECT_STATUSES:
+            disabled_result = 'INCONCLUSIVE'
+            print(
+                f'Inconclusive: the sudo token was rejected (HTTP {status}) but {window}; '
+                'ordinary expiry cannot be ruled out.'
+            )
+        else:
+            disabled_result = 'INCONCLUSIVE'
+            print(
+                f'Inconclusive: the sudo-token project query failed with HTTP {status} '
+                f'({window}); cannot distinguish revocation from an outage.'
+            )
+        input(f'Step: Re-enable the test user {context.sudo_login!r}, then press Enter... ')
+        count, status = _count_projects(context.session, context.site_url, sudo_token)
+        if count is not None:
+            print('Note: after re-enabling the user, SG accepted the outstanding sudo token.')
+        elif status in _AUTH_REJECT_STATUSES:
+            print(
+                f'Note: after re-enabling the user, SG rejected the outstanding sudo token '
+                f'(HTTP {status}).'
+            )
+        else:
+            print(
+                'Inconclusive: after re-enabling the user, the sudo-token project query failed '
+                f'with HTTP {status}; cannot determine the outstanding token state.'
+            )
+    finally:
+        print(
+            f'Restore: make sure the test user {context.sudo_login!r} is re-enabled in SG '
+            '(Admin > People) before you leave.'
+        )
+    return disabled_result
 
 
 def _readable_ca_bundle(value: str) -> str:
@@ -356,21 +374,14 @@ def _run_survey(context: _SurveyContext) -> int:
             f'clean rejection ({error}).'
         )
 
-    _compare_project_visibility(context.session, context.site_url, plain_token, sudo_token)
-
-    def mint_sudo() -> tuple[str | None, int, int, str]:
-        return _mint_rest_token(
-            context.session,
-            context.site_url,
-            context.script_name,
-            context.key,
-            f'sudo_as_login:{context.sudo_login}',
-        )
+    observed_working = _compare_project_visibility(
+        context.session, context.site_url, plain_token, sudo_token
+    )
 
     disabled_result = _check_disabled_user(
         context,
-        mint_sudo,
         sudo_token,
+        observed_working=observed_working,
         minted_at=minted_at,
         expires_in=sudo_expires,
     )
@@ -387,8 +398,9 @@ def _main(
     parser = argparse.ArgumentParser(
         description=(__doc__ or '').splitlines()[0],
         epilog=(
-            'Exit status: 0 if the disabled-user check was conclusive, 2 for a setup '
-            'error, and 3 if the disabled-user check was inconclusive.'
+            'Exit 0 means the disabled-user check reached a conclusion. Exit 2 means setup '
+            'failed or a request could not be sent or completed. Exit 3 means the check ran '
+            'but its evidence could not distinguish revocation from another cause.'
         ),
     )
     parser.add_argument('--site-url', required=True, help='SG site URL')

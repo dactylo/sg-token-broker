@@ -185,9 +185,20 @@ gcloud run deploy sg-user-tokens \
     --env-vars-file ~/sg-user-tokens.env.yaml
 ```
 
-The service handles at most 32 requests at a time and closes any further connection without a
-response. `--concurrency 32` makes Cloud Run start another instance instead of sending an instance
-more requests than it can answer.
+The service handles at most 32 requests at a time. When full, it sends 503 `server_busy` with
+`Retry-After: 1` if it can respond immediately. Otherwise it closes the connection.
+`--concurrency 32` makes Cloud Run start another instance instead of sending an instance more
+requests than it can answer.
+
+Cloud Run normally routes new requests to other instances and gives active requests time to finish
+before sending SIGTERM. The shipped image runs tini as PID 1 so it can forward stop signals from
+container startup, even before the token service is ready. The service exits immediately on SIGTERM
+(status 143) or SIGINT (status 130). If a request is still in flight, its connection is cut off and
+the client retries under its normal retry policy.
+[Cloud Run shutdown behavior](https://docs.cloud.google.com/run/docs/container-contract#instance-shutdown)
+
+If you build your own image, run the service under tini or dumb-init, or start it with
+`docker run --init`.
 
 Authorize the caller group:
 
@@ -252,10 +263,10 @@ Kubernetes ingress or reverse proxy terminating TLS. Configure the deployment as
 
 A private deployment can use Google Workspace identity, as on Cloud Run, or a generic OIDC provider
 such as Okta, Microsoft Entra ID, Auth0, or Keycloak. For OIDC, set `SGUT_PROVIDER=oidc` and set
-`SGUT_ISSUER` to the provider's exact issuer URL. The configured email claim must be unique and
-immutable for each user in that provider, because the service maps it to an SG account. Enable
-`SGUT_ASSUME_EMAIL_VERIFIED` only when the provider asserts verified addresses without including an
-`email_verified` claim.
+`SGUT_ISSUER` to the provider's exact issuer URL without embedded credentials. The configured email
+claim must be unique and immutable for each user in that provider, because the service maps it to
+an SG account. Enable `SGUT_ASSUME_EMAIL_VERIFIED` only when the provider asserts verified
+addresses without including an `email_verified` claim.
 
 The Dockerfile installs both provider extras and starts `serve-user-tokens`. Outside the container,
 install from a checkout with `uv tool install '.[google]'` or `uv tool install '.[oidc]'` for your
@@ -315,11 +326,16 @@ export SG_USER_TOKEN_CLIENT_SECRET='installed-app-client-secret'
 ```
 
 Google is the default provider. Leave `SG_USER_TOKEN_CLIENT_SECRET` unset when your provider issued
-no secret. For another OIDC provider, also set its exact issuer URL:
+no secret. For another OIDC provider, also set its issuer URL without embedded credentials:
 
 ```sh
 export SG_USER_TOKEN_ISSUER='https://identity.example.invalid'
 ```
+
+If the token endpoint rejects a grant, the sign-in command reports the step, issuer host and HTTP
+status. A recognized OAuth code includes a local repair hint. For `invalid_client`, check
+`SG_USER_TOKEN_CLIENT_ID` and set `SG_USER_TOKEN_CLIENT_SECRET` if the provider requires it. For
+`invalid_grant`, sign in again. Provider descriptions are omitted.
 
 Sign in through the system browser, then request the token type your service issues:
 
@@ -338,7 +354,15 @@ Python applications use `UserTokenClient`, which reads the same environment vari
 own Python environment. The client checks the current sign-in on every `fetch_token` call and
 reuses a cached SG token only while the ID token's `sub` claim matches the identity that obtained
 it, so switching accounts takes effect on the next call. It requests a new REST token 60 seconds
-before `expires_at`, and keeps a session until you pass `force_refresh=True`.
+before `expires_at` by default, and keeps a session until you pass `force_refresh=True`. A failed
+refresh raises `UserTokenClientError` without falling back to the old token.
+
+`get-user-token` accepts `--timeout` (10 seconds), `--retries` (no cap by default, 0 for one
+request) and `--max-wait` (300 seconds). The service-request budget starts after sign-in. Retries
+use the same identity and do not reopen the browser. A request started within budget may finish
+later. Python callers set `timeout`, `retries`, `refresh_margin`, and `max_wait` directly as
+keyword arguments to `UserTokenClient`. For ranges, retryable errors and stopping messages, see
+[Client tuning and retries](deployment.md#client-tuning-and-retries).
 
 ### Manage stored accounts
 
@@ -431,22 +455,29 @@ deployment its own script account; after a compromise, follow
 
 Use the status and service audit record together to find the cause:
 
-| Symptom              | What to check                                                                                                                                                                                                                                                                                                                                                          |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 401                  | The ID token was rejected. A service audit `detail` identifies the failed check, such as `audience not accepted`, `email domain not allowed`, or `email is not verified`. Cloud Run can also reject the token before it reaches the service.                                                                                                                           |
-| 403                  | Check the requested token type, a unique matching active SG account, and Cloud Run invoker-group membership. A service `deny` with reason `forbidden` means the token type is disabled, no single user matches, or SG refused issuance for that user. A 403 with no service event came from Cloud Run IAM; new bindings and group changes take a few minutes to apply. |
-| 500                  | Check server logs for an identity-provider failure or unexpected error. Provider failures return an opaque 500 so an outage is not reported as a rejected identity.                                                                                                                                                                                                    |
-| 502 for every caller | Check the service script key and Secret Manager version first. An invalid key produces an `error` event with reason `upstream_error`. Also check SG's REST token lifetime, as described below.                                                                                                                                                                         |
+| Symptom | What to check                                                                                                                                                                                                                                                                                                                                                          |
+| ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 401     | The ID token was rejected. A service audit `detail` identifies the failed check, such as `audience not accepted`, `email domain not allowed`, or `email is not verified`. Cloud Run can also reject the token before it reaches the service.                                                                                                                           |
+| 403     | Check the requested token type, a unique matching active SG account, and Cloud Run invoker-group membership. A service `deny` with reason `forbidden` means the token type is disabled, no single user matches, or SG refused issuance for that user. A 403 with no service event came from Cloud Run IAM; new bindings and group changes take a few minutes to apply. |
+| 500     | Check server logs for an identity-provider failure or unexpected error. Provider failures return an opaque 500 so an outage is not reported as a rejected identity.                                                                                                                                                                                                    |
+| 502     | Look up the service audit reason. For `sg_rejected`, check the service script key and permissions, including permission to act for users. For `sg_invalid_response`, inspect the SG response or token lifetime.                                                                                                                                                        |
+| 503     | `upstream_unavailable` means SG could not complete a lookup, mint, or session check. `server_busy` means the service has no worker available. Retry after the indicated delay.                                                                                                                                                                                         |
 
-For REST requests, an SG lifetime of 150 seconds or less causes 502 with audit detail
+A positive REST lifetime of 150 seconds or less causes 502 with audit detail
 `SG token lifetime too short to serve`. The service reuses REST tokens for up to 120 seconds and
-keeps a 30-second margin before expiry.
+keeps a 30-second margin before expiry. A zero or negative lifetime also fails as an invalid SG
+response.
 
 ### Audit logs
 
-The service writes one JSON line to standard output for each issuance, denial, or error; Cloud Run
-collects these. `token_fp` is the first 16 hexadecimal characters of the token's SHA-256 digest,
-which lets you match a found token to its issuance without logging the token itself.
+For each issuance, denial or error, the service attempts to write and flush a JSON audit line to
+standard output before sending the first byte of the final response. This includes HTTP parser
+rejections. Successful health checks, interim `100 Continue` responses and listener-level
+`server_busy` refusals have no audit event. Retention depends on the log destination, such as Cloud
+Logging. An issuance record can exist even if a stop interrupts its response.
+
+`token_fp` is the first 16 hexadecimal characters of the token's SHA-256 digest, which lets you
+match a found token to its issuance without logging the token itself.
 
 | Event                               | Fields                                                                                               |
 | ----------------------------------- | ---------------------------------------------------------------------------------------------------- |
@@ -460,7 +491,8 @@ which lets you match a found token to its issuance without logging the token its
 - `cache` is `hit` for a reused token, `miss` for a newly minted one, and `kept` when a forced
   refresh found the cached session still valid.
 - `reason` comes from a fixed set: `unauthorized`, `forbidden`, `bad_request`, `not_found`,
-  `method_not_allowed`, `upstream_error`, or `internal_error`.
+  `method_not_allowed`, `sg_rejected`, `sg_invalid_response`, `upstream_unavailable`, or
+  `internal_error`. A listener-level `server_busy` response precedes request auditing.
 - An unrecognized `token_type` is recorded as `invalid`.
 - On Cloud Run, `source_ip` is the address of Google's front end, not the caller's. Cloud Run's
   request log records each caller's address as `httpRequest.remoteIp`.
@@ -521,18 +553,23 @@ A successful response contains these fields:
 Errors return JSON with `error` and `detail` fields. For a 400, `detail` describes the problem; for
 other errors it stays generic, and the specific cause goes to the server logs.
 
-| Status | `error`              | Meaning                                                                                               |
-| ------ | -------------------- | ----------------------------------------------------------------------------------------------------- |
-| 400    | `bad_request`        | Unknown or repeated query parameter, a `token_type` other than `rest` or `session`, or a request body |
-| 401    | `unauthorized`       | The service rejected the caller's ID token                                                            |
-| 403    | `forbidden`          | The deployment does not issue that token type, no single SG user matches, or SG refused the user      |
-| 404    | `not_found`          | Unknown path                                                                                          |
-| 405    | `method_not_allowed` | Unsupported method                                                                                    |
-| 500    | `internal_error`     | The identity provider failed during verification, or an unexpected error occurred                     |
-| 502    | `upstream_error`     | An SG request failed                                                                                  |
+| Status | `error`                | Meaning                                                                                               |
+| ------ | ---------------------- | ----------------------------------------------------------------------------------------------------- |
+| 400    | `bad_request`          | Unknown or repeated query parameter, a `token_type` other than `rest` or `session`, or a request body |
+| 401    | `unauthorized`         | The service rejected the caller's ID token                                                            |
+| 403    | `forbidden`            | The deployment does not issue that token type, no single SG user matches, or SG refused the user      |
+| 404    | `not_found`            | Unknown path                                                                                          |
+| 405    | `method_not_allowed`   | Unsupported method                                                                                    |
+| 500    | `internal_error`       | The identity provider failed during verification, or an unexpected error occurred                     |
+| 502    | `sg_rejected`          | SG refused a service request, for example because the minter's credentials or permissions are wrong.  |
+| 502    | `sg_invalid_response`  | SG returned malformed data or an unusable lifetime.                                                   |
+| 503    | `upstream_unavailable` | Temporary SG failure. The service sends `Retry-After: 1`.                                             |
+| 503    | `server_busy`          | All workers are busy. The listener sends `Retry-After: 1` if it can respond.                          |
 
-Correct the request before retrying a 400. On Cloud Run, IAM can also answer 401 or 403, with its
-own body, before a request reaches the service.
+If a forced session check cannot reach SG, the service keeps its cached session and answers 503.
+Only a definite authentication rejection prompts replacement of a live cached session. Correct the
+request before retrying a 400. On Cloud Run, IAM can also answer 401 or 403, with its own body,
+before a request reaches the service.
 
 `GET /healthz` answers `{"status": "ok"}`.
 

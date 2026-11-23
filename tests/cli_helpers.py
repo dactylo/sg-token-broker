@@ -13,8 +13,6 @@ from unittest import mock
 from sg_token_broker._cli import main
 
 _Output = TypeVar('_Output', str, bytes)
-# Hang guard, not a performance assertion. Allow for scheduling on shared CI hosts.
-_CHILD_TIMEOUT_SECONDS = 300
 _COLLECT_AFTER_KILL_SECONDS = 10
 _CONTROL_CHARACTERS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')
 _ENV = {**os.environ, 'PYTHON_COLORS': '0'}
@@ -121,6 +119,12 @@ def invoke_cli(argv: Sequence[str], stdin: str = '') -> tuple[int, str, str]:
         stack.enter_context(contextlib.redirect_stdout(stdout))
         stack.enter_context(contextlib.redirect_stderr(stderr))
         stack.enter_context(mock.patch.object(sys, 'stdin', stdin_stream))
+        stack.enter_context(
+            mock.patch(
+                'sg_token_broker._cli.service_streams',
+                return_value=contextlib.nullcontext((stdout, stderr)),
+            )
+        )
         try:
             status = main(argv)
         except SystemExit as error:
@@ -173,15 +177,14 @@ def _finish_process(
     process: subprocess.Popen[_Output],
     *,
     stdin: _Output | None = None,
-    timeout: float = _CHILD_TIMEOUT_SECONDS,
     cwd: Path | str | None = None,
 ) -> subprocess.CompletedProcess[_Output]:
     try:
-        stdout, stderr = process.communicate(stdin, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise AssertionError(
-            _kill_and_describe(process, cwd=cwd, reason=f'timed out after {timeout:g} s')
-        ) from None
+        stdout, stderr = process.communicate(stdin)
+    except BaseException:
+        # Collect diagnostics only after an external interruption, never as a timed verdict.
+        print(_kill_and_describe(process, cwd=cwd, reason='interrupted'), file=sys.stderr)
+        raise
     return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
 

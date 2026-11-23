@@ -1,6 +1,6 @@
 import pytest
 
-from sg_token_broker._urlpolicy import is_loopback_host, require_https_or_loopback
+from sg_token_broker._urlpolicy import endpoint_origin, is_loopback_host, require_https_or_loopback
 
 
 class TestRequireHttpsOrLoopback:
@@ -68,6 +68,28 @@ class TestRequireHttpsOrLoopback:
     def test_rejects_raw_control_or_whitespace(self, url: str) -> None:
         with pytest.raises(ValueError, match='site_url'):
             require_https_or_loopback(url, 'site_url')
+
+
+def test_idna_origin_matches_the_transport_for_sharp_s() -> None:
+    assert endpoint_origin('https://faß.example/path') == 'https://xn--fa-hia.example'
+
+
+def test_internationalized_origin_uses_ascii_dns() -> None:
+    assert endpoint_origin('https://münchen.example:8443/private?q=x') == (
+        'https://xn--mnchen-3ya.example:8443'
+    )
+
+
+def test_invalid_endpoint_keeps_private_url_parts_out_of_diagnostic() -> None:
+    with pytest.raises(ValueError, match='not a valid URL') as caught:
+        require_https_or_loopback(
+            'https://account:private@service.example:bad?x=query-value#fragment', 'broker URL'
+        )
+    assert 'broker URL' in str(caught.value)
+    assert all(
+        value not in str(caught.value)
+        for value in ('account', 'private', 'query-value', 'fragment')
+    )
 
 
 @pytest.mark.parametrize('host', ['localhost', 'LOCALHOST', '127.0.0.1', '::1'])

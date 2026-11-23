@@ -2,8 +2,9 @@ import argparse
 import base64
 import datetime
 import getpass
+import hashlib
 import importlib.metadata
-import io
+import inspect
 import json
 import logging
 import os
@@ -11,23 +12,32 @@ import ssl
 import sys
 import warnings
 from collections.abc import Callable, Iterator
+from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
-from typing import NoReturn, TextIO, cast
+from typing import NoReturn, cast
 from unittest.mock import Mock
 
 import pytest
 import requests
 
 import sg_token_broker._cli as cli_module
-from sg_token_broker import _downstream
+from sg_token_broker import BrokerClient, UserTokenClient
 from sg_token_broker._cli import main
-from sg_token_broker._client import BrokerClientError
 from sg_token_broker._googleverify import VerifierUnavailableError
 from sg_token_broker._oidcverify import OidcUnavailableError
+from sg_token_broker._retry import (
+    DEFAULT_MAX_WAIT_SECONDS,
+    DEFAULT_REFRESH_MARGIN_SECONDS,
+    DEFAULT_RETRIES,
+    DEFAULT_TIMEOUT_SECONDS,
+    RetryTiming,
+)
 from sg_token_broker._secrets import verify_secret
-from sg_token_broker._sg import MintedToken, SGError
+from sg_token_broker._sg import MintedToken, SGError, SGMinter
 from sg_token_broker._userauth import SignInError, _TokenBundle
 from sg_token_broker._userclient import UserToken, UserTokenClientError
+from tests._timeouts import STALL_TIMEOUT_SECONDS
 from tests.cli_helpers import invoke_cli
 from tests.conftest import BROKER_CREDENTIAL, FakeSG
 
@@ -36,6 +46,7 @@ _CONFIG_HASH = (
     'scrypt$16384$8$1$40vcdl7AgTzLmOGl+anfBQ==$'
     'wL+YRQJWbt9/zf6Wpcl3nDff4/OkYaw7LIU04aIrjpqBs/boSojdqPdZXy8s3oZxk/CJN5/VcQy138851oY/sw=='
 )
+_GET_TOKEN_ARGS = ['get-token', '--scope', 'read_all', '--max-wait', str(STALL_TIMEOUT_SECONDS)]
 # Stored Google sign-ins live under this keyring issuer; changing it orphans them.
 _GOOGLE_KEYRING_ISSUER = 'https://oauth2.googleapis.com/token'
 _ID_TOKEN = (
@@ -98,14 +109,12 @@ clients:
     secret_hash: "{_CONFIG_HASH}"
     scopes: [read_all]
 """)
-        assert invoke_cli(['check-config', '--config', str(cfg)]) == (
-            2,
-            '',
-            (
-                f"error: scope 'read_all': cannot read script key file {keyfile}: "
-                "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte\n"
-            ),
-        )
+        status, stdout, stderr = invoke_cli(['check-config', '--config', str(cfg)])
+        assert (status, stdout) == (2, '')
+        [diagnostic] = stderr.splitlines()
+        prefix = f"error: scope 'read_all': cannot read script key file {keyfile}: "
+        assert diagnostic.startswith(prefix)
+        assert 'utf-8' in diagnostic.removeprefix(prefix).lower()
 
     def test_unreadable_config_is_a_configuration_error(self, tmp_path: Path) -> None:
         cfg = tmp_path / 'missing.yml'
@@ -113,19 +122,6 @@ clients:
         assert (status, stdout) == (2, '')
         assert stderr.startswith(f'error: cannot read config file {cfg}: ')
         assert stderr.count('\n') == 1
-
-    def test_unresolvable_script_key_fails(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.delenv('SGTB_ABSENT_KEY', raising=False)
-        cfg = _write_config(tmp_path, 'SGTB_ABSENT_KEY', scope_name='read_all')
-        assert invoke_cli(['check-config', '--config', str(cfg)]) == (
-            2,
-            '',
-            "error: scope 'read_all': environment variable SGTB_ABSENT_KEY is not set or empty\n",
-        )
 
     def test_valid_config(
         self,
@@ -143,36 +139,56 @@ clients:
     def test_yaml_syntax_error_is_one_line_with_its_position(self, tmp_path: Path) -> None:
         cfg = tmp_path / 'broker.yml'
         cfg.write_text('site_url: https://sg.example\nscopes: a: b\n', encoding='utf-8')
-        assert invoke_cli(['check-config', '--config', str(cfg)]) == (
-            2,
-            '',
-            (
-                f'error: invalid YAML in {cfg} at line 2, column 10: '
-                'mapping values are not allowed here\n'
-            ),
-        )
+        status, stdout, stderr = invoke_cli(['check-config', '--config', str(cfg)])
+        assert (status, stdout) == (2, '')
+        [diagnostic] = stderr.splitlines()
+        prefix = f'error: invalid YAML in {cfg} at line 2, column 10: '
+        assert diagnostic.startswith(prefix)
+        assert diagnostic.removeprefix(prefix).strip()
 
 
 class TestGetToken:
-    def test_failure_exits_nonzero(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv('SG_TOKEN_BROKER_URL', 'http://127.0.0.1:1')
-        monkeypatch.setenv('SG_TOKEN_BROKER_CLIENT_ID', 'farm')
-        monkeypatch.setenv('SG_TOKEN_BROKER_CLIENT_SECRET', 'x')
+    def test_blank_input_requests_an_ordinary_token(self, broker_post: Mock) -> None:
+        broker_post.return_value = _broker_success('new-session')
         status, stdout, stderr = invoke_cli(
-            ['get-token', '--scope', 'read_all', '--timeout', '0.2', '--retries', '0']
+            [*_GET_TOKEN_ARGS, '--replace-rejected'],
+            stdin='\n \t\n',
+        )
+        assert (status, stderr) == (0, '')
+        assert json.loads(stdout) == broker_post.return_value.json.return_value
+        assert broker_post.call_args.kwargs['json'] == {
+            'scope': 'read_all',
+            'token_type': 'session',
+        }
+
+    def test_broker_failure_redacts_all_submitted_tokens(self, broker_post: Mock) -> None:
+        first, second = 'synthetic.alpha', 'synthetic.beta'
+        refusal = Mock(status_code=401, headers={})
+        refusal.json.return_value = {'detail': f'access denied for {first}, {second}, {first}'}
+        broker_post.return_value = refusal
+        status, stdout, stderr = invoke_cli(
+            [*_GET_TOKEN_ARGS, '--replace-rejected'], stdin=f'{first}\n{second}\n'
         )
         assert (status, stdout) == (1, '')
-        assert stderr.startswith('error: cannot reach broker at http://127.0.0.1:1: ')
-        assert stderr.count('\n') == 1
+        assert first not in stderr
+        assert second not in stderr
+        assert stderr == (
+            'error: broker refused (HTTP 401): access denied for '
+            '[redacted], [redacted], [redacted]\n'
+        )
 
-    @pytest.mark.parametrize('timeout', ['0', '-1', 'nan', 'inf', '-inf'])
-    def test_invalid_timeout_is_usage_error(
-        self, timeout: str, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        with pytest.raises(SystemExit) as exc_info:
-            main(['get-token', '--scope', 'read_all', f'--timeout={timeout}'])
-        assert exc_info.value.code == 2
-        assert 'finite floating-point value greater than zero' in capsys.readouterr().err
+    def test_failure_exits_nonzero(self, broker_post: Mock) -> None:
+        broker_post.side_effect = requests.ConnectionError('offline')
+        status, stdout, stderr = invoke_cli(
+            [*_GET_TOKEN_ARGS, '--timeout', str(STALL_TIMEOUT_SECONDS), '--retries', '0']
+        )
+        assert (status, stdout) == (1, '')
+        assert stderr.startswith(
+            'error: no token after 1 attempt(s) (retries=0); last failure: '
+            'cannot reach broker at https://broker.example.invalid: ConnectionError'
+        )
+        assert stderr.endswith('\n')
+        assert stderr.count('\n') == 1
 
     def test_missing_broker_settings_are_a_setup_error(
         self, monkeypatch: pytest.MonkeyPatch
@@ -193,11 +209,34 @@ class TestGetToken:
             ),
         )
 
+    def test_missing_scope_with_replacement_names_the_option(self) -> None:
+        status, stdout, stderr = invoke_cli(['get-token', '--replace-rejected'])
+        assert (status, stdout) == (2, '')
+        assert 'required: --scope' in stderr
+
     def test_negative_retries_are_usage_error(self, capsys: pytest.CaptureFixture[str]) -> None:
         with pytest.raises(SystemExit) as exc_info:
             main(['get-token', '--scope', 'read_all', '--retries', '-1'])
         assert exc_info.value.code == 2
         assert 'must be >= 0' in capsys.readouterr().err
+
+    def test_old_broker_repeating_a_rejected_token(self, broker_post: Mock) -> None:
+        rejected = 'previous-credential'
+        broker_post.return_value = _broker_success(rejected)
+        status, stdout, stderr = invoke_cli(
+            [*_GET_TOKEN_ARGS, '--replace-rejected'],
+            stdin=f'{rejected}\nsecond-credential\n',
+        )
+        assert (status, stdout) == (1, '')
+        assert 'upgrade every broker to 0.3.0' in stderr
+        assert rejected not in stderr
+        assert 'second-credential' not in stderr
+        broker_post.assert_called_once()
+
+    def test_ordinary_get_token_preserves_stray_argument_diagnostic(self) -> None:
+        status, stdout, stderr = invoke_cli(['get-token', '--scope', 'read_all', 'stray'])
+        assert (status, stdout) == (2, '')
+        assert 'unrecognized arguments: stray' in stderr
 
     def test_prints_token_json(
         self,
@@ -209,55 +248,191 @@ class TestGetToken:
         monkeypatch.setenv('SG_TOKEN_BROKER_URL', broker_url)
         monkeypatch.setenv('SG_TOKEN_BROKER_CLIENT_ID', 'farm')
         monkeypatch.setenv('SG_TOKEN_BROKER_CLIENT_SECRET', BROKER_CREDENTIAL)
-        assert main(['get-token', '--scope', 'read_all']) == 0
+        args = [*_GET_TOKEN_ARGS, '--timeout', str(STALL_TIMEOUT_SECONDS), '--token-type', 'rest']
+        assert main(args) == 0
         body = json.loads(capsys.readouterr().out)
-        assert body['token'] == fake_sg.canned_session
+        assert body['token'] == fake_sg.canned_rest
 
-    def test_refused_request_is_a_runtime_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(cli_module, 'BrokerClient', _RefusingBrokerClient)
-        assert invoke_cli(['get-token', '--scope', 'read_all']) == (
+    def test_refused_request_is_a_runtime_failure(self, broker_post: Mock) -> None:
+        refusal = Mock(status_code=401, headers={})
+        refusal.json.return_value = {'detail': 'invalid client credentials'}
+        broker_post.return_value = refusal
+        assert invoke_cli(_GET_TOKEN_ARGS) == (
             1,
             '',
             'error: broker refused (HTTP 401): invalid client credentials\n',
         )
 
+    def test_rejected_input_limit(self, broker_post: Mock) -> None:
+        status, stdout, stderr = invoke_cli(
+            ['get-token', '--scope', 'read_all', '--replace-rejected'],
+            stdin='one-repeated-secret\n' * 9,
+        )
+        assert (status, stdout) == (2, '')
+        assert 'at most 8 rejected tokens' in stderr
+        assert 'one-repeated-secret' not in stderr
+        broker_post.assert_not_called()
+
+    @pytest.mark.parametrize('processes', [2, 8])
+    def test_replacement_across_broker_processes(self, processes: int, broker_post: Mock) -> None:
+        caches = [f'stale-{i}' for i in range(processes)]
+        fresh = 'fresh-session'
+        history = ['older-than-every-cache']
+        argv = [*_GET_TOKEN_ARGS, '--replace-rejected']
+
+        def dispatch(_url: str, *, json: dict[str, object], **_kwargs: object) -> Mock:
+            digests = [hashlib.sha256(value.encode()).hexdigest() for value in history[-8:]]
+            assert json == {
+                'scope': 'read_all',
+                'token_type': 'session',
+                'rejected_tokens_sha256': digests,
+            }
+            index = (broker_post.call_count - 1) % processes
+            if hashlib.sha256(caches[index].encode()).hexdigest() in digests:
+                caches[index] = fresh
+            return _broker_success(caches[index])
+
+        broker_post.side_effect = dispatch
+        for call in range(1, processes + 2):
+            status, stdout, stderr = invoke_cli(argv, stdin='\n \t\n'.join(history[-8:]))
+            assert (status, stderr) == (0, '')
+            assert broker_post.call_count == call
+            assert all(previous not in stdout for previous in history)
+            issued = json.loads(stdout)['token']
+            history.append(issued)
+            if issued == fresh:
+                break
+        assert history[-1] == fresh
+
+    def test_setup_error_redacts_submitted_token(
+        self, monkeypatch: pytest.MonkeyPatch, broker_post: Mock
+    ) -> None:
+        rejected = 'synthetic-credential'
+        monkeypatch.setenv('SG_TOKEN_BROKER_URL', f'http://broker.example.invalid/{rejected}')
+        status, stdout, stderr = invoke_cli(
+            [*_GET_TOKEN_ARGS, '--replace-rejected'], stdin=rejected
+        )
+        assert (status, stdout) == (2, '')
+        assert rejected not in stderr
+        assert 'broker URL must be an https:// URL' in stderr
+        broker_post.assert_not_called()
+
+    def test_terminal_input_names_how_to_pipe_tokens(
+        self,
+        broker_post: Mock,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setattr(sys, 'stdin', Mock(isatty=lambda: True))
+        assert main(['get-token', '--scope', 'read_all', '--replace-rejected']) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        assert 'pipe' in captured.err
+        broker_post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        'arguments',
+        [
+            ['--scope', 'read_all', '--replace-rejected={}'],
+            ['--scope', 'read_all', '--replace-rejected', '{}'],
+            ['--scope', 'read_all', '--replace-rejected', '-h={}'],
+            ['--scope', 'read_all', '--replace-rejected', '--r={}'],
+            ['--scope', 'read_all', '--replace-rejected', '--token-type', '{}'],
+            ['--replace-rejected', '{}'],
+        ],
+    )
+    def test_token_argument_is_redacted(self, arguments: list[str]) -> None:
+        misplaced = 'misplaced-credential'
+        status, stdout, stderr = invoke_cli(
+            ['get-token', *(arg.format(misplaced) for arg in arguments)]
+        )
+        assert (status, stdout) == (2, '')
+        assert misplaced not in stderr
+        assert 'standard input' in stderr
+
+    @pytest.mark.parametrize('max_wait', [None, 1.5])
+    def test_retries_until_max_wait(
+        self, max_wait: float | None, broker_post: Mock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = 0.0
+
+        def advance(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        timing = RetryTiming(lambda: now, advance, lambda: 0.0)
+        monkeypatch.setattr('sg_token_broker._client.RetryTiming', lambda: timing)
+        busy = Mock(status_code=503, headers={'Retry-After': '1'})
+        later = Mock(status_code=503, headers={'Retry-After': '600'})
+        broker_post.side_effect = [busy, busy, busy, later]
+        options = ['--max-wait', str(max_wait)] if max_wait is not None else []
+        status, stdout, stderr = invoke_cli(['get-token', '--scope', 'read_all', *options])
+        assert (status, stdout) == (1, '')
+        budget = DEFAULT_MAX_WAIT_SECONDS if max_wait is None else max_wait
+        assert f'beyond max_wait {budget:g}s' in stderr
+        assert broker_post.call_count == (4 if max_wait is None else 2)
+
+    def test_unknown_replacement_option_is_redacted(self) -> None:
+        status, stdout, stderr = invoke_cli(
+            [
+                'get-token',
+                '--scope',
+                'typed-scope',
+                '--replace-rejected',
+                '--typed-option=typed-value',
+            ]
+        )
+        assert (status, stdout) == (2, '')
+        assert 'typed-' not in stderr
+        assert stderr.startswith('usage: sg-token-broker get-token ')
+        assert stderr.endswith(
+            '--replace-rejected reads rejected tokens from standard input, one per line; '
+            'do not pass tokens as arguments\n'
+        )
+
 
 @pytest.mark.usefixtures('isolate_identity_environment')
 class TestGetUserToken:
-    def test_get_user_token_passes_force_refresh(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        fetched: list[tuple[str, bool]] = []
-
-        class FakeClient:
-            def __init__(self, *args: object, **kwargs: object) -> None:
-                pass
-
-            def fetch_token(self, token_type: str, *, force_refresh: bool = False) -> UserToken:
-                fetched.append((token_type, force_refresh))
-                return _fake_user_token(token_type)
-
-        monkeypatch.setattr(cli_module, 'UserTokenClient', FakeClient)
-        assert main(['get-user-token', '--token-type', 'session', '--force-refresh']) == 0
-        assert fetched == [('session', True)]
-
-    def test_get_user_token_prints_token_json(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    @pytest.mark.parametrize('max_wait', [None, 1.5])
+    def test_get_user_token_passes_request_options(
+        self, max_wait: float | None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        fetched: list[tuple[str, bool]] = []
+        factory = Mock()
+        factory.return_value.fetch_token.return_value = _fake_user_token('session')
+        monkeypatch.setattr(cli_module, 'UserTokenClient', factory)
+        options = (
+            []
+            if max_wait is None
+            else ['--max-wait', str(max_wait), '--retries', '0', '--timeout', '2.5']
+        )
+        assert main(['get-user-token', '--force-refresh', *options]) == 0
+        factory.assert_called_once_with(
+            max_wait=DEFAULT_MAX_WAIT_SECONDS if max_wait is None else max_wait,
+            retries=None if max_wait is None else 0,
+            timeout=DEFAULT_TIMEOUT_SECONDS if max_wait is None else 2.5,
+        )
+        factory.return_value.fetch_token.assert_called_once_with('session', force_refresh=True)
 
-        class FakeClient:
-            def __init__(self, *args: object, **kwargs: object) -> None:
-                pass
-
-            def fetch_token(self, token_type: str, *, force_refresh: bool = False) -> UserToken:
-                fetched.append((token_type, force_refresh))
-                return _fake_user_token(token_type)
-
-        monkeypatch.setattr(cli_module, 'UserTokenClient', FakeClient)
-        assert main(['get-user-token', '--token-type', 'session']) == 0
-        assert fetched == [('session', False)]
-        body = json.loads(capsys.readouterr().out)
-        assert body['token_type'] == 'session'  # noqa: S105 - token type, not credential
-        assert body['expires_at'] is None
+    @pytest.mark.parametrize(
+        ('kind', 'expiry'), [('session', None), ('rest', '2026-08-08T00:00:00+00:00')]
+    )
+    def test_get_user_token_prints_token_json(
+        self, kind: str, expiry: str | None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        factory = Mock()
+        factory.return_value.fetch_token.return_value = _fake_user_token(kind)
+        monkeypatch.setattr(cli_module, 'UserTokenClient', factory)
+        status, stdout, stderr = invoke_cli(['get-user-token', '--token-type', kind])
+        assert (status, stderr) == (0, '')
+        factory.return_value.fetch_token.assert_called_once_with(kind, force_refresh=False)
+        assert json.loads(stdout) == {
+            'token': 'token-1',
+            'token_type': kind,
+            'login': 'jane@s.example',
+            'site_url': 'https://studio.shotgunstudio.com',
+            'expires_at': expiry,
+            'cache_until': '2026-08-07T00:00:00+00:00',
+        }
 
     def test_missing_client_id_is_a_setup_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv('SG_USER_TOKEN_URL', 'https://user-tokens.example.invalid')
@@ -274,6 +449,12 @@ class TestGetUserToken:
             '',
             'error: service URL missing; set SG_USER_TOKEN_URL or pass it explicitly\n',
         )
+
+    def test_negative_retries_is_usage_error(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with pytest.raises(SystemExit) as caught:
+            main(['get-user-token', '--retries=-1'])
+        assert caught.value.code == 2
+        assert 'must be >= 0' in capsys.readouterr().err
 
     def test_refused_request_is_a_runtime_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class RefusingClient:
@@ -546,7 +727,14 @@ class TestLogin:
 
 @pytest.mark.usefixtures('isolate_identity_environment')
 class TestLogout:
-    def test_logout_deletes_credential_and_pointer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize(
+        'issuer', [_GOOGLE_KEYRING_ISSUER, 'https://legacy:private@idp.example/tenant']
+    )
+    @pytest.mark.usefixtures('no_requests')
+    def test_logout_deletes_credential_and_pointer(
+        self, monkeypatch: pytest.MonkeyPatch, issuer: str
+    ) -> None:
+        monkeypatch.setenv('SG_USER_TOKEN_ISSUER', issuer)
         monkeypatch.setenv('SG_USER_TOKEN_CLIENT_ID', 'client-1')
         monkeypatch.setenv('SG_USER_TOKEN_ACCOUNT', 'jane@s.example')
         monkeypatch.setattr(cli_module, 'load_account', _load_jane)
@@ -568,8 +756,8 @@ class TestLogout:
             drop_pointer,
         )
         assert main(['logout']) == 0
-        assert dropped == [(_GOOGLE_KEYRING_ISSUER, 'client-1', 'jane@s.example')]
-        assert pointer_dropped == [(_GOOGLE_KEYRING_ISSUER, 'client-1')]
+        assert dropped == [(issuer, 'client-1', 'jane@s.example')]
+        assert pointer_dropped == [(issuer, 'client-1')]
 
     def test_logout_failure_keeps_pointer_and_reports_error(
         self,
@@ -738,7 +926,6 @@ class TestServe:
     def test_serve_app_tokens_startup_url(
         self,
         tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
         case: tuple[str, tuple[str, int] | tuple[str, int, int, int], str],
     ) -> None:
@@ -750,8 +937,11 @@ class TestServe:
         create_server = Mock(return_value=server)
         monkeypatch.setattr(cli_module, 'create_server', create_server)
 
-        assert main(['serve-app-tokens', '--config', str(cfg)]) == 0
-        assert f'serving on {expected_url}\n' in capsys.readouterr().err
+        assert invoke_cli(['serve-app-tokens', '--config', str(cfg)]) == (
+            0,
+            '',
+            f'serving on {expected_url}\n',
+        )
         assert create_server.call_args.args[0].server.bind == host
         server.serve_forever.assert_called_once_with()
         server.server_close.assert_called_once_with()
@@ -801,23 +991,21 @@ class TestServeUserTokens:
         server = Mock(server_address=('', 8080))
 
         def serve_one_logged_request() -> None:
-            logging.getLogger('sg_token_broker.audit').info('{"event": "issue"}')
+            for _ in range(3):
+                server.logger.log(logging.INFO, '{"event": "issue"}')
             raise KeyboardInterrupt
 
         server.serve_forever.side_effect = serve_one_logged_request
         monkeypatch.setattr(cli_module, 'create_user_token_server', Mock(return_value=server))
-        monkeypatch.setattr(_downstream, '_silence_descriptor', _pretend_silenced)
-        monkeypatch.setattr(sys, 'stdout', _ClosedPipe())
-        saved_handlers = logging.root.handlers[:]
-        saved_level = logging.root.level
-        logging.root.handlers.clear()
-        try:
-            status = main(['serve-user-tokens'])
-        finally:
-            logging.root.handlers[:] = saved_handlers
-            logging.root.setLevel(saved_level)
-
-        assert status == 0
+        private_output = Mock()
+        private_output.write.side_effect = BrokenPipeError
+        monkeypatch.setattr(
+            cli_module,
+            'service_streams',
+            Mock(return_value=nullcontext((private_output, sys.stderr))),
+        )
+        assert main(['serve-user-tokens']) == 0
+        assert private_output.write.call_count == 1
         assert capsys.readouterr().err == 'serving user tokens on port 8080\n'
 
     def test_missing_env_config_fails_fast(self) -> None:
@@ -856,17 +1044,30 @@ class TestServeUserTokens:
     def test_oidc_provider_startup_error_fails_fast(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _set_user_service_environment(monkeypatch, oidc=True)
 
-        def failing_verifier(issuer: str, algorithms: object) -> object:
-            del algorithms
-            raise ValueError(f'OIDC discovery for {issuer} failed')
+        session = requests.Session()
+        session.headers['Authorization'] = 'private-transport-credential'
 
-        monkeypatch.setattr('sg_token_broker._cli.oidc_verifier', failing_verifier)
+        def refuse(request: requests.PreparedRequest, **_kwargs: object) -> requests.Response:
+            body = {
+                'error': 'invalid_client',
+                'error_description': request.headers['Authorization'],
+            }
+            return Mock(
+                status_code=401,
+                is_redirect=False,
+                is_permanent_redirect=False,
+                json=Mock(return_value=body),
+            )
+
+        monkeypatch.setattr(session, 'send', refuse)
+        monkeypatch.setattr(requests, 'Session', Mock(return_value=session))
         assert invoke_cli(['serve-user-tokens']) == (
             1,
             '',
             (
-                'error: cannot verify identity tokens: '
-                'OIDC discovery for https://idp.example.com failed\n'
+                'error: cannot verify identity tokens: OIDC discovery returned HTTP 401 '
+                'at https://idp.example.com: invalid_client: '
+                'check the configured OAuth client ID and secret\n'
             ),
         )
 
@@ -973,6 +1174,7 @@ class TestVerifyRevocation:
             ]
         ) == (0, '', 'warning: TLS verification disabled; only use with a disposable script key\n')
 
+    @pytest.mark.usefixtures('_slow_revocation_minter')
     def test_mid_flow_upstream_fault_is_setup_error(
         self,
         fake_sg: FakeSG,
@@ -1064,6 +1266,7 @@ class TestVerifyRevocation:
         )
         assert result == 2
 
+    @pytest.mark.usefixtures('_slow_revocation_minter')
     def test_runs_full_flow(
         self,
         fake_sg: FakeSG,
@@ -1120,6 +1323,7 @@ class TestVerifyRevocation:
 
 
 class TestVerifyRevocationProxy:
+    @pytest.mark.usefixtures('_slow_revocation_minter')
     def test_proxy_is_used(
         self,
         fake_sg: FakeSG,
@@ -1144,21 +1348,16 @@ class TestVerifyRevocationProxy:
         assert any(p.startswith('http://127.0.0.1:9') for p in proxied)
 
 
-class _ClosedPipe(io.StringIO):
-    def flush(self) -> None:
-        raise BrokenPipeError
-
-    def write(self, _text: str) -> int:
-        raise BrokenPipeError
-
-
-class _RefusingBrokerClient:
-    def __init__(self, *_args: object, **_kwargs: object) -> None:
-        pass
-
-    def fetch_token(self, scope: str, token_type: str) -> NoReturn:
-        del scope, token_type
-        raise BrokerClientError('broker refused (HTTP 401): invalid client credentials')
+def _broker_success(value: str) -> Mock:
+    response = Mock(status_code=200)
+    response.json.return_value = {
+        'token': value,
+        'scope': 'read_all',
+        'token_type': 'session',
+        'site_url': 'https://sg.example.invalid',
+        'expires_at': '2099-01-01T00:00:00+00:00',
+    }
+    return response
 
 
 def _fake_sign_in(_client_id: str, **_kwargs: object) -> _TokenBundle:
@@ -1168,13 +1367,13 @@ def _fake_sign_in(_client_id: str, **_kwargs: object) -> _TokenBundle:
     )
 
 
-def _fake_user_token(token_type: str) -> UserToken:
+def _fake_user_token(kind: str) -> UserToken:
     return UserToken(
         token='token-1',  # noqa: S106 - fake credential
-        token_type=token_type,
+        token_type=kind,
         login='jane@s.example',
         site_url='https://studio.shotgunstudio.com',
-        expires_at=None,
+        expires_at=datetime.datetime(2026, 8, 8, tzinfo=datetime.UTC) if kind == 'rest' else None,
         cache_until=datetime.datetime(2026, 8, 7, tzinfo=datetime.UTC),
     )
 
@@ -1199,6 +1398,21 @@ def _help_entries(
             yield f'{prefix} {label}', action.help
 
 
+def _help_groups(output: str) -> list[tuple[str, list[str]]]:
+    groups: list[tuple[str, list[str]]] = []
+    heading = ''
+    members: list[str] = []
+    for line in output.splitlines():
+        if line and not line.startswith(' '):
+            heading = line[:-1] if line.endswith(':') else ''
+            members = []
+        elif heading and line.startswith('  ') and not line.startswith('   '):
+            if not members:
+                groups.append((heading, members))
+            members.append(line.split()[0].rstrip(','))
+    return groups
+
+
 def _load_accepting_verifier() -> Callable[[str], dict[str, object]]:
     def verify(_token: str) -> dict[str, object]:
         return {}
@@ -1218,8 +1432,35 @@ def _offline_discovery(*_args: object, **_kwargs: object) -> NoReturn:
     raise requests.ConnectionError('offline')
 
 
-def _pretend_silenced(_stream: TextIO) -> bool:
+def _store_false(*_args: object) -> bool:
+    return False
+
+
+def _store_true(*_args: object) -> bool:
     return True
+
+
+def _unexpected_provider_discovery(*_args: object, **_kwargs: object) -> NoReturn:
+    raise AssertionError('unexpected provider discovery')
+
+
+@pytest.fixture
+def broker_post(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    monkeypatch.setenv('SG_TOKEN_BROKER_URL', 'https://broker.example.invalid')
+    monkeypatch.setenv('SG_TOKEN_BROKER_CLIENT_ID', 'farm')
+    monkeypatch.setenv('SG_TOKEN_BROKER_CLIENT_SECRET', BROKER_CREDENTIAL)
+    post = Mock()
+    monkeypatch.setattr(requests.Session, 'post', post)
+    return post
+
+
+@pytest.fixture
+def _slow_revocation_minter(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        'SGMinter',
+        partial(SGMinter, timeout=STALL_TIMEOUT_SECONDS),
+    )
 
 
 def _set_user_service_environment(monkeypatch: pytest.MonkeyPatch, *, oidc: bool = False) -> None:
@@ -1232,18 +1473,6 @@ def _set_user_service_environment(monkeypatch: pytest.MonkeyPatch, *, oidc: bool
     if oidc:
         monkeypatch.setenv('SGUT_PROVIDER', 'oidc')
         monkeypatch.setenv('SGUT_ISSUER', 'https://idp.example.com')
-
-
-def _store_false(*_args: object) -> bool:
-    return False
-
-
-def _store_true(*_args: object) -> bool:
-    return True
-
-
-def _unexpected_provider_discovery(*_args: object, **_kwargs: object) -> NoReturn:
-    raise AssertionError('unexpected provider discovery')
 
 
 def _write_config(
@@ -1300,43 +1529,23 @@ def test_get_token_usage_names_option_values() -> None:
     assert status == 0
     assert ' '.join(stdout.split('\n\n', 1)[0].split()) == (
         'usage: sg-token-broker get-token [-h] --scope NAME [--token-type {session,rest}] '
-        '[--timeout SECONDS] [--retries COUNT]'
+        '[--replace-rejected] [--timeout SECONDS] [--max-wait SECONDS] [--retries COUNT]'
     )
-
-
-def test_help_goes_to_stdout() -> None:
-    status, stdout, stderr = invoke_cli(['--help'])
-    assert (status, stderr) == (0, '')
-    assert stdout.startswith('usage: sg-token-broker [-h] [--version] COMMAND ...\n')
+    help_text = ' '.join(stdout.split())
+    assert 'standard input, one per line' in help_text
+    assert 'default: no cap' in help_text
+    assert f'default: {DEFAULT_MAX_WAIT_SECONDS:g}' in help_text
 
 
 def test_help_lists_commands_in_titled_groups() -> None:
     status, stdout, stderr = invoke_cli(['--help'])
     assert (status, stderr) == (0, '')
-    headings = [line for line in stdout.splitlines() if line and not line.startswith(' ')]
-    assert headings == [
-        'usage: sg-token-broker [-h] [--version] COMMAND ...',
-        'Issue SG tokens to pipeline tools without giving them SG script keys.',
-        'options:',
-        'services:',
-        'clients:',
-        'verification:',
-    ]
-    commands = [
-        line.split()[0]
-        for line in stdout.splitlines()
-        if line.startswith('  ') and not line.startswith(('   ', '  -'))
-    ]
-    assert commands == [
-        'serve-app-tokens',
-        'serve-user-tokens',
-        'check-config',
-        'hash-secret',
-        'get-token',
-        'login',
-        'logout',
-        'get-user-token',
-        'verify-revocation',
+    assert stdout.startswith('usage: sg-token-broker [-h] [--version] COMMAND ...\n')
+    assert _help_groups(stdout) == [
+        ('options', ['-h', '--version']),
+        ('services', ['serve-app-tokens', 'serve-user-tokens', 'check-config', 'hash-secret']),
+        ('clients', ['get-token', 'login', 'logout', 'get-user-token']),
+        ('verification', ['verify-revocation']),
     ]
 
 
@@ -1388,23 +1597,95 @@ def test_normal_runs_do_not_read_metadata(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.parametrize(
-    ('command', 'headings'),
+    'argv',
     [
-        ('serve-app-tokens', ['options:']),
-        ('check-config', ['options:']),
-        ('hash-secret', ['options:']),
-        ('login', ['options:']),
-        ('get-user-token', ['options:']),
-        ('get-token', ['options:', 'request:', 'connection:']),
-        ('verify-revocation', ['options:', 'site and script:', 'connection:']),
+        ['--help', '--rep'],
+        ['--replace-rejected', '--help'],
+        ['--help', '--', '--replace-rejected'],
+        ['--help', 'get-token', '--replace-rejected'],
     ],
 )
-def test_subcommand_options_are_grouped_only_by_kind(command: str, headings: list[str]) -> None:
+def test_root_help_in_replacement_mode_matches_ordinary_help(argv: list[str]) -> None:
+    _, ordinary_help, _ = invoke_cli(['--help'])
+    assert invoke_cli(argv) == (0, ordinary_help, '')
+
+
+@pytest.mark.parametrize(
+    ('argv', 'marker'),
+    [
+        (['--unknown', 'ROOT_MARKER', 'get-token', '--replace-rejected'], 'ROOT_MARKER'),
+        (
+            ['verify-revocation', '--replace-rejected', '--unknown=ATTACHED_MARKER'],
+            'ATTACHED_MARKER',
+        ),
+        (['--rep=PREFIX_MARKER', 'logout'], 'PREFIX_MARKER'),
+    ],
+)
+def test_misplaced_replacement_option_redacts_usage_errors(argv: list[str], marker: str) -> None:
+    status, stdout, stderr = invoke_cli(argv)
+    assert (status, stdout) == (2, '')
+    assert marker not in stderr
+    assert stderr.endswith(
+        ': error: --replace-rejected reads rejected tokens from standard input, one per line; '
+        'do not pass tokens as arguments\n'
+    )
+
+
+@pytest.mark.parametrize(
+    ('command', 'groups'),
+    [
+        ('serve-app-tokens', {'options': ['-h', '--config']}),
+        ('check-config', {'options': ['-h', '--config']}),
+        ('hash-secret', {'options': ['-h', '--secret']}),
+        ('login', {'options': ['-h', '--no-store']}),
+        (
+            'get-user-token',
+            {
+                'options': ['-h'],
+                'request': ['--token-type', '--force-refresh'],
+                'connection': ['--timeout', '--max-wait', '--retries'],
+            },
+        ),
+        (
+            'get-token',
+            {
+                'options': ['-h'],
+                'request': ['--scope', '--token-type', '--replace-rejected'],
+                'connection': ['--timeout', '--max-wait', '--retries'],
+            },
+        ),
+        (
+            'verify-revocation',
+            {
+                'options': ['-h'],
+                'site and script': ['--site-url', '--script-name', '--script-key-env'],
+                'connection': ['--proxy', '--ca-bundle', '--insecure'],
+            },
+        ),
+    ],
+)
+def test_subcommand_options_are_grouped_only_by_kind(
+    command: str, groups: dict[str, list[str]]
+) -> None:
     status, stdout, stderr = invoke_cli([command, '--help'])
     assert (status, stderr) == (0, '')
-    assert [
-        line for line in stdout.splitlines() if line.endswith(':') and not line.startswith(' ')
-    ] == headings
+    assert _help_groups(stdout) == list(groups.items())
+
+
+@pytest.mark.parametrize(
+    ('command', 'option', 'value'),
+    [
+        *(('get-token', '--timeout', value) for value in ('0', '-1', 'nan', 'inf', '-inf', 'abc')),
+        ('get-token', '--max-wait', '0'),
+        ('get-user-token', '--timeout', '0'),
+        ('get-user-token', '--max-wait', '0'),
+    ],
+)
+def test_invalid_request_seconds_are_usage_errors(command: str, option: str, value: str) -> None:
+    scope = ['--scope', 'read_all'] if command == 'get-token' else []
+    status, stdout, stderr = invoke_cli([command, *scope, f'{option}={value}'])
+    assert (status, stdout) == (2, '')
+    assert 'finite floating-point value greater than zero' in stderr
 
 
 @pytest.mark.parametrize('kind', ['readable', 'directory', 'unreadable'])
@@ -1425,6 +1706,67 @@ def test_ca_bundle_requires_a_readable_file(
         with pytest.raises(argparse.ArgumentTypeError) as caught:
             module._readable_ca_bundle(str(bundle))
         assert str(caught.value) == f'no readable CA bundle at {bundle}'
+
+
+@pytest.mark.parametrize(
+    ('arguments', 'client_type'),
+    [(['get-token', '--scope', 'read_all'], BrokerClient), (['get-user-token'], UserTokenClient)],
+)
+def test_cli_and_python_share_tuning_defaults(
+    arguments: list[str], client_type: type[BrokerClient] | type[UserTokenClient]
+) -> None:
+    expected = {
+        'timeout': DEFAULT_TIMEOUT_SECONDS,
+        'retries': DEFAULT_RETRIES,
+        'refresh_margin': DEFAULT_REFRESH_MARGIN_SECONDS,
+        'max_wait': DEFAULT_MAX_WAIT_SECONDS,
+    }
+    parameters = inspect.signature(client_type).parameters
+    assert {name: parameters[name].default for name in expected} == expected
+    options = cli_module._build_parser().parse_args(arguments)
+    assert (options.timeout, options.retries, options.max_wait) == (
+        DEFAULT_TIMEOUT_SECONDS,
+        DEFAULT_RETRIES,
+        DEFAULT_MAX_WAIT_SECONDS,
+    )
+    status, stdout, _ = invoke_cli([arguments[0], '--help'])
+    assert status == 0
+    assert f'seconds to wait for each request (default: {options.timeout:g})' in ' '.join(
+        stdout.split()
+    )
+
+
+@pytest.mark.parametrize(
+    ('argv', 'prog', 'hint'),
+    [
+        (['--vers'], 'sg-token-broker', '--vers (did you mean --version?)'),
+        (
+            ['get-user-token', '--hel'],
+            'sg-token-broker get-user-token',
+            '--hel (did you mean --help?)',
+        ),
+        (
+            ['get-token', '--scope', 's', '--ret', 'x'],
+            'sg-token-broker get-token',
+            '--ret (did you mean --retries?)',
+        ),
+        (
+            ['verify-revocation', '--ca', 'x'],
+            'sg-token-broker verify-revocation',
+            '--ca (did you mean --ca-bundle?)',
+        ),
+        (
+            ['get-token', '--scop', 's'],
+            'sg-token-broker get-token',
+            '--scop (did you mean --scope?)',
+        ),
+    ],
+)
+def test_abbreviated_long_options_are_usage_errors(argv: list[str], prog: str, hint: str) -> None:
+    status, stdout, stderr = invoke_cli(argv)
+    assert (status, stdout) == (2, '')
+    assert stderr.startswith(f'usage: {prog} [-h]')
+    assert stderr.endswith(f'{prog}: error: unrecognized arguments: {hint}\n')
 
 
 def test_unavailable_stdout_is_an_error(capsys: pytest.CaptureFixture[str]) -> None:

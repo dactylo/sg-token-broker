@@ -25,6 +25,7 @@ from sg_token_broker._usertoken import (
     UserTokenService,
     _IssuedUserToken,
 )
+from tests._timeouts import STALL_TIMEOUT_SECONDS
 from tests.conftest import FakeSG
 
 _AUDIENCE = 'client-id-123.apps.googleusercontent.com'
@@ -33,6 +34,7 @@ _DOMAIN = 'studio.example'
 _EMAIL = 'jane.exec@studio.example'
 _LOGIN = 'jane.exec'
 _REST_TYPE = _usertoken._REST_TYPE
+_SESSION_TTL_SECONDS = 173
 _SESSION_TYPE = _usertoken._SESSION_TYPE
 
 
@@ -61,15 +63,14 @@ class TestConnectionLifetime:
     ) -> None:
         first = b'GET /healthz HTTP/1.1\r\nHost: svc\r\n\r\n'
         second = b'GET /healthz HTTP/1.1\r\nHost: svc\r\nConnection: close\r\n\r\n'
-        raw = _raw_exchange(http_only_service_url, first + second)
+        raw = _raw_exchange(http_only_service_url, first + second, allow_reset=True)
         assert raw.startswith(b'HTTP/1.1 200')
-        assert b'connection: close' in raw.lower()
         assert raw.count(b'HTTP/1.1 ') == 1
 
 
 class TestHealthz:
     def test_ok_without_auth(self, http_only_service_url: str) -> None:
-        response = requests.get(f'{http_only_service_url}/healthz', timeout=5)
+        response = requests.get(f'{http_only_service_url}/healthz')
         assert response.status_code == 200
         assert response.json() == {'status': 'ok'}
 
@@ -89,7 +90,6 @@ class TestProviderFaultClassification:
             response = requests.get(
                 f'{url}/v1/user-token',
                 headers={'Authorization': 'Bearer x'},
-                timeout=5,
             )
         assert response.status_code == 500
         assert response.json() == {'error': 'internal_error', 'detail': 'internal error'}
@@ -106,40 +106,42 @@ class TestQueryParameters:
         response = requests.get(
             f'{http_only_service_url}/v1/user-token?token_type=rest&token_type=session',
             headers={'Authorization': f'Bearer {_EMAIL}'},
-            timeout=5,
         )
         assert response.status_code == 400
 
-    def test_session_response_has_null_expires_and_cache_until(self, service_url: str) -> None:
+    def test_session_response_has_null_expiry_and_cache_horizon(
+        self, service_url: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        issued_at = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+        monkeypatch.setattr(_usertoken, '_utcnow', lambda: issued_at)
         response = requests.get(
             f'{service_url}/v1/user-token?token_type=session',
             headers={'Authorization': f'Bearer {_EMAIL}'},
-            timeout=5,
         )
         assert response.status_code == 200
         body = response.json()
         assert body['expires_at'] is None
-        assert isinstance(body['cache_until'], str)
+        assert datetime.datetime.fromisoformat(
+            body['cache_until']
+        ) == issued_at + datetime.timedelta(seconds=_SESSION_TTL_SECONDS)
 
     def test_token_type_and_refresh_reach_the_service(
-        self, service_url: str, recorded_requests: list[UserTokenRequest]
+        self, http_only_service_url: str, recorded_requests: list[UserTokenRequest]
     ) -> None:
         response = requests.get(
-            f'{service_url}/v1/user-token?token_type=session&refresh=true',
+            f'{http_only_service_url}/v1/user-token?token_type=session&refresh=true',
             headers={'Authorization': f'Bearer {_EMAIL}'},
-            timeout=5,
         )
         assert response.status_code == 200
         assert recorded_requests[-1].token_type == _SESSION_TYPE
         assert recorded_requests[-1].refresh is True
 
     def test_token_type_defaults_to_rest(
-        self, service_url: str, recorded_requests: list[UserTokenRequest]
+        self, http_only_service_url: str, recorded_requests: list[UserTokenRequest]
     ) -> None:
         requests.get(
-            f'{service_url}/v1/user-token',
+            f'{http_only_service_url}/v1/user-token',
             headers={'Authorization': f'Bearer {_EMAIL}'},
-            timeout=5,
         )
         assert recorded_requests[-1].token_type == _REST_TYPE
         assert recorded_requests[-1].refresh is False
@@ -147,34 +149,32 @@ class TestQueryParameters:
 
 class TestTrustedProxies:
     def test_forwarded_for_honored_from_trusted_peer(
-        self, trusted_service_url: str, recorded_requests: list[UserTokenRequest]
+        self, http_only_trusted_service_url: str, recorded_requests: list[UserTokenRequest]
     ) -> None:
         requests.get(
-            f'{trusted_service_url}/v1/user-token',
+            f'{http_only_trusted_service_url}/v1/user-token',
             headers={
                 'Authorization': f'Bearer {_EMAIL}',
                 'X-Forwarded-For': '203.0.113.9',
             },
-            timeout=5,
         )
         assert recorded_requests[-1].source_ip == '203.0.113.9'
 
     def test_forwarded_for_ignored_from_untrusted_peer(
-        self, service_url: str, recorded_requests: list[UserTokenRequest]
+        self, http_only_service_url: str, recorded_requests: list[UserTokenRequest]
     ) -> None:
         requests.get(
-            f'{service_url}/v1/user-token',
+            f'{http_only_service_url}/v1/user-token',
             headers={
                 'Authorization': f'Bearer {_EMAIL}',
                 'X-Forwarded-For': '203.0.113.9',
             },
-            timeout=5,
         )
         assert recorded_requests[-1].source_ip == '127.0.0.1'
 
     def test_last_forwarded_field_wins_from_trusted_peer(
         self,
-        trusted_service_url: str,
+        http_only_trusted_service_url: str,
         recorded_requests: list[UserTokenRequest],
     ) -> None:
         payload = (
@@ -186,7 +186,7 @@ class TestTrustedProxies:
             + b'Connection: close\r\n\r\n'
         )
 
-        raw = _raw_exchange(trusted_service_url, payload)
+        raw = _raw_exchange(http_only_trusted_service_url, payload)
 
         assert raw.startswith(b'HTTP/1.1 200')
         assert recorded_requests[-1].source_ip == '198.51.100.7'
@@ -202,7 +202,6 @@ class TestTrustedProxies:
                 'Authorization': f'Bearer {_EMAIL}',
                 'X-Forwarded-For': '203.0.113.9',
             },
-            timeout=5,
         )
         assert recorded_requests[-1].source_ip == '203.0.113.9'
 
@@ -268,7 +267,7 @@ def _serve_with_verifier(
         fake_sg.rpc_unique_human_sessions = True
         fake_sg.rest_credentials = {'usersvc': 'svc-credential'}
         site_url = fake_sg.url
-        minter = SGMinter(site_url)
+        minter = SGMinter(site_url, timeout=STALL_TIMEOUT_SECONDS)
         directory = UserDirectory(site_url, minter, 'usersvc', 'svc-credential')
     service = UserTokenService(
         ServiceAccount(site_url, 'usersvc', 'svc-credential'),
@@ -276,8 +275,10 @@ def _serve_with_verifier(
         directory,
         minter,
         AuditLogger(logging.getLogger('test-userhttp-audit')),
+        session_ttl_seconds=_SESSION_TTL_SECONDS,
         token_types=frozenset({'rest', 'session'}),
     )
+    service._cache._clock = lambda: 0.0
     server = create_user_token_server('127.0.0.1', 0, service, trusted_proxies=trusted_proxies)
     thread = threading.Thread(
         target=server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True
@@ -288,6 +289,7 @@ def _serve_with_verifier(
     finally:
         server.shutdown()
         server.server_close()
+        thread.join()
 
 
 def _serve(
@@ -309,18 +311,25 @@ def http_only_trusted_service_url() -> Iterator[str]:
 
 
 @pytest.fixture
-def mapped_trusted_service_url(fake_sg: FakeSG) -> Iterator[str]:
-    yield from _serve(fake_sg, frozenset({normalize_ip('::ffff:127.0.0.1')}))
+def mapped_trusted_service_url() -> Iterator[str]:
+    yield from _serve(None, frozenset({normalize_ip('::ffff:127.0.0.1')}))
 
 
 @pytest.fixture
 def recorded_requests(monkeypatch: pytest.MonkeyPatch) -> list[UserTokenRequest]:
     captured: list[UserTokenRequest] = []
-    original = UserTokenService.issue_token
+    issued = _IssuedUserToken(
+        'issued',
+        token_type=_SESSION_TYPE,
+        login=_LOGIN,
+        site_url='https://studio.example',
+        expires_at=None,
+        cache_until=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
+    )
 
-    def record(self: UserTokenService, request: UserTokenRequest) -> _IssuedUserToken:
+    def record(_self: UserTokenService, request: UserTokenRequest) -> _IssuedUserToken:
         captured.append(request)
-        return original(self, request)
+        return issued
 
     monkeypatch.setattr(UserTokenService, 'issue_token', record)
     return captured
@@ -331,18 +340,36 @@ def service_url(fake_sg: FakeSG) -> Iterator[str]:
     yield from _serve(fake_sg, frozenset())
 
 
-def _raw_exchange(service_url: str, payload: bytes) -> bytes:
+def _raw_exchange(service_url: str, payload: bytes, *, allow_reset: bool = False) -> bytes:
     host, _, port = service_url.removeprefix('http://').partition(':')
-    with socket.create_connection((host, int(port)), timeout=10) as sock:
+    with socket.create_connection((host, int(port))) as sock:
         sock.sendall(payload)
-        sock.settimeout(10)
         chunks: list[bytes] = []
         while True:
-            data = sock.recv(65536)
+            try:
+                data = sock.recv(65536)
+            except ConnectionResetError:
+                if not allow_reset:
+                    raise
+                # Linux may reset after rejecting unread client bytes. The full
+                # response must still have arrived; verify its framing below.
+                break
             if not data:
                 break
             chunks.append(data)
-    return b''.join(chunks)
+    raw = b''.join(chunks)
+    head, separator, body = raw.partition(b'\r\n\r\n')
+    assert separator, 'connection closed before complete response headers'
+    lengths = [
+        line.partition(b':')[2].strip()
+        for line in head.split(b'\r\n')[1:]
+        if line.lower().startswith(b'content-length:')
+    ]
+    assert len(lengths) == 1, 'expected one response Content-Length'
+    assert b'connection: close' in head.lower()
+    expected_length = 0 if payload.startswith(b'HEAD ') else int(lengths[0])
+    assert len(body) == expected_length, 'connection closed before the complete response body'
+    return raw
 
 
 @pytest.fixture
@@ -363,9 +390,8 @@ class TestRequestFraming:
         self, http_only_service_url: str, length_headers: bytes, body: bytes
     ) -> None:
         head = b'GET /healthz HTTP/1.1\r\nHost: svc\r\n' + length_headers + b'\r\n' + body
-        raw = _raw_exchange(http_only_service_url, head)
+        raw = _raw_exchange(http_only_service_url, head, allow_reset=True)
         assert raw.startswith(b'HTTP/1.1 400')
-        assert b'connection: close' in raw.lower()
         assert raw.count(b'HTTP/1.1 ') == 1
 
     def test_get_transfer_encoding_is_rejected_and_closed(
@@ -374,14 +400,12 @@ class TestRequestFraming:
         head = b'GET /healthz HTTP/1.1\r\nHost: svc\r\nTransfer-Encoding: chunked\r\n\r\n'
         raw = _raw_exchange(http_only_service_url, head)
         assert raw.startswith(b'HTTP/1.1 400')
-        assert b'connection: close' in raw.lower()
         assert raw.count(b'HTTP/1.1 ') == 1
 
     def test_get_with_body_is_rejected_and_closed(self, http_only_service_url: str) -> None:
         head = b'GET /healthz HTTP/1.1\r\nHost: svc\r\nContent-Length: 5\r\n\r\nxxxxx'
-        raw = _raw_exchange(http_only_service_url, head)
+        raw = _raw_exchange(http_only_service_url, head, allow_reset=True)
         assert raw.startswith(b'HTTP/1.1 400')
-        assert b'connection: close' in raw.lower()
         assert raw.count(b'HTTP/1.1 ') == 1
 
     def test_get_with_large_nonzero_length_is_rejected_before_routing(
@@ -391,7 +415,6 @@ class TestRequestFraming:
         head = b'GET /nope HTTP/1.1\r\nHost: svc\r\nContent-Length: ' + length + b'\r\n\r\n'
         raw = _raw_exchange(http_only_service_url, head)
         assert raw.startswith(b'HTTP/1.1 400')
-        assert b'connection: close' in raw.lower()
         assert raw.count(b'HTTP/1.1 ') == 1
 
     def test_get_with_large_zero_length_succeeds(self, http_only_service_url: str) -> None:
@@ -403,7 +426,6 @@ class TestRequestFraming:
         )
         raw = _raw_exchange(http_only_service_url, head)
         assert raw.startswith(b'HTTP/1.1 200')
-        assert b'connection: close' in raw.lower()
         assert raw.count(b'HTTP/1.1 ') == 1
 
     @pytest.mark.parametrize(
@@ -417,7 +439,6 @@ class TestRequestFraming:
         head = b'GET /healthz HTTP/1.1\r\nHost: svc\r\nContent-Length: ' + length + b'\r\n\r\n'
         raw = _raw_exchange(http_only_service_url, head)
         assert raw.startswith(b'HTTP/1.1 400')
-        assert b'connection: close' in raw.lower()
         assert raw.count(b'HTTP/1.1 ') == 1
 
     def test_get_with_zero_length_succeeds(self, http_only_service_url: str) -> None:
@@ -467,19 +488,32 @@ class TestRequestFraming:
 
 
 class TestUserTokenEndpoint:
+    def test_authentication_probe_fault_replaces_session(
+        self, service_url: str, fake_sg: FakeSG
+    ) -> None:
+        url = f'{service_url}/v1/user-token?token_type=session'
+        headers = {'Authorization': f'Bearer {_EMAIL}'}
+        first = requests.get(url, headers=headers).json()['token']
+        fake_sg.disabled_human_sessions.add(first)
+        refreshed = requests.get(f'{url}&refresh=true', headers=headers)
+        assert refreshed.status_code == 200
+        assert refreshed.json()['token'] != first
+
     def test_forged_token_is_401(self, http_only_service_url: str) -> None:
         response = requests.get(
             f'{http_only_service_url}/v1/user-token',
             headers={'Authorization': 'Bearer forged'},
-            timeout=5,
         )
         assert response.status_code == 401
 
-    def test_issues_token(self, service_url: str, fake_sg: FakeSG) -> None:
+    def test_issues_token(
+        self, service_url: str, fake_sg: FakeSG, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        issued_at = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+        monkeypatch.setattr(_usertoken, '_utcnow', lambda: issued_at)
         response = requests.get(
             f'{service_url}/v1/user-token',
             headers={'Authorization': f'Bearer {_EMAIL}'},
-            timeout=5,
         )
         assert response.status_code == 200
         assert response.headers['Cache-Control'] == 'no-store'
@@ -488,11 +522,28 @@ class TestUserTokenEndpoint:
         assert body['token_type'] == _REST_TYPE
         assert body['login'] == _LOGIN
         assert body['site_url'] == fake_sg.url
+        assert body['cache_until'] == body['expires_at']
         expires_at = datetime.datetime.fromisoformat(body['expires_at'])
-        assert expires_at > datetime.datetime.now(datetime.UTC)
+        assert expires_at == issued_at + datetime.timedelta(
+            seconds=fake_sg.rest_expires_in - _usertoken._REST_EXPIRY_MARGIN_SECONDS
+        )
+
+    def test_malformed_probe_keeps_cached_session(self, service_url: str, fake_sg: FakeSG) -> None:
+        url = f'{service_url}/v1/user-token?token_type=session'
+        headers = {'Authorization': f'Bearer {_EMAIL}'}
+        first = requests.get(url, headers=headers).json()['token']
+        fake_sg.rpc_response_overrides.append((200, {'message': 'missing session ID'}))
+        response = requests.get(f'{url}&refresh=true', headers=headers)
+        assert response.status_code == 502
+        assert response.json() == {
+            'error': 'sg_invalid_response',
+            'detail': 'SG upstream request failed',
+        }
+        assert 'Retry-After' not in response.headers
+        assert requests.get(url, headers=headers).json()['token'] == first
 
     def test_missing_auth_is_401(self, http_only_service_url: str) -> None:
-        response = requests.get(f'{http_only_service_url}/v1/user-token', timeout=5)
+        response = requests.get(f'{http_only_service_url}/v1/user-token')
         assert response.status_code == 401
         assert response.json()['error'] == 'unauthorized'
 
@@ -529,14 +580,108 @@ class TestUserTokenEndpoint:
         if line != 'GET /v1/user-token?token_type=weird HTTP/1.1':
             assert set(lines[0]) == {'ts', 'event', 'reason', 'source_ip', 'request_id'}
 
-    def test_sg_outage_is_502(self, service_url: str, fake_sg: FakeSG) -> None:
-        fake_sg.fail_user_lookup = True
+    @pytest.mark.parametrize(
+        'case',
+        [
+            (
+                {
+                    'exception': True,
+                    'error_code': 102,
+                    'message': "Cannot 'sudo' - inactive user account",
+                },
+                403,
+                'forbidden',
+                'SG refused to issue a token for this user',
+            ),
+            (
+                {
+                    'exception': True,
+                    'error_code': 102,
+                    'message': "The script does not have permission to 'sudo'",
+                },
+                502,
+                'sg_rejected',
+                'SG upstream request failed',
+            ),
+            (
+                {'unexpected': 'SG response detail'},
+                502,
+                'sg_invalid_response',
+                'SG upstream request failed',
+            ),
+        ],
+    )
+    def test_failed_session_mint(
+        self,
+        service_url: str,
+        fake_sg: FakeSG,
+        case: tuple[dict[str, object], int, str, str],
+    ) -> None:
+        body, status, error, detail = case
+        fake_sg.rpc_response_overrides.append((200, body))
         response = requests.get(
-            f'{service_url}/v1/user-token',
+            f'{service_url}/v1/user-token?token_type=session',
             headers={'Authorization': f'Bearer {_EMAIL}'},
-            timeout=5,
         )
-        assert response.status_code == 502
+        assert response.status_code == status
+        assert response.json() == {'error': error, 'detail': detail}
+        assert 'Retry-After' not in response.headers
+
+    @pytest.mark.parametrize(
+        'case',
+        [
+            (401, 502, 'sg_rejected', None),
+            (200, 502, 'sg_invalid_response', None),
+            (204, 502, 'sg_invalid_response', None),
+            (429, 503, 'upstream_unavailable', '1'),
+        ],
+    )
+    def test_lookup_failure_response(
+        self, service_url: str, fake_sg: FakeSG, case: tuple[int, int, str, str | None]
+    ) -> None:
+        lookup_status, status, error, retry_after = case
+        # The 200 response has an SG errors array in place of the required data list.
+        fake_sg.fail_entities_status = lookup_status
+        response = requests.get(
+            f'{service_url}/v1/user-token', headers={'Authorization': f'Bearer {_EMAIL}'}
+        )
+        assert response.status_code == status
+        assert response.json() == {'error': error, 'detail': 'SG upstream request failed'}
+        assert response.headers.get('Retry-After') == retry_after
+
+    @pytest.mark.parametrize('path', ['/api/v1.1/entity/human_users', '/api3/json'])
+    def test_lookup_or_mint_disconnect(self, service_url: str, fake_sg: FakeSG, path: str) -> None:
+        fake_sg.disconnect_path = path
+        response = requests.get(
+            f'{service_url}/v1/user-token?token_type=session',
+            headers={'Authorization': f'Bearer {_EMAIL}'},
+        )
+        assert response.status_code == 503
+        assert response.json() == {
+            'error': 'upstream_unavailable',
+            'detail': 'SG upstream request failed',
+        }
+        assert response.headers['Retry-After'] == '1'
+
+    @pytest.mark.parametrize('failure', ['rpc_fault', 'disconnect'])
+    def test_inconclusive_probe_keeps_cached_session(
+        self, service_url: str, fake_sg: FakeSG, failure: str
+    ) -> None:
+        url = f'{service_url}/v1/user-token?token_type=session'
+        headers = {'Authorization': f'Bearer {_EMAIL}'}
+        first = requests.get(url, headers=headers).json()['token']
+        if failure == 'rpc_fault':
+            fake_sg.rpc_fault = True
+        else:
+            fake_sg.disconnect_path = '/api3/json'
+        response = requests.get(f'{url}&refresh=true', headers=headers)
+        assert response.status_code == 503
+        assert response.json() == {
+            'error': 'upstream_unavailable',
+            'detail': 'SG upstream request failed',
+        }
+        assert response.headers['Retry-After'] == '1'
+        assert requests.get(url, headers=headers).json()['token'] == first
 
     def test_source_ip_prefers_forwarded_header(
         self, trusted_service_url: str, caplog: pytest.LogCaptureFixture
@@ -548,7 +693,6 @@ class TestUserTokenEndpoint:
                     'Authorization': f'Bearer {_EMAIL}',
                     'X-Forwarded-For': 'spoofed, 198.51.100.7',
                 },
-                timeout=5,
             )
         assert response.status_code == 200
         record = json.loads(caplog.records[-1].getMessage())
@@ -561,7 +705,6 @@ class TestUserTokenEndpoint:
             response = requests.get(
                 f'{http_only_service_url}/v1/user-token',
                 headers={'Authorization': 'Bearer boom@studio.example'},
-                timeout=5,
             )
         assert response.status_code == 500
         assert response.json() == {'error': 'internal_error', 'detail': 'internal error'}
@@ -576,7 +719,6 @@ class TestUserTokenEndpoint:
         response = requests.get(
             f'{service_url}/v1/user-token',
             headers={'Authorization': 'Bearer ghost@studio.example'},
-            timeout=5,
         )
         assert response.status_code == 403
         assert response.json()['error'] == 'forbidden'

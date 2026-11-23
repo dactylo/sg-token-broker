@@ -1,7 +1,6 @@
-import subprocess
 import sys
 
-from tests.cli_helpers import process_transcript, run_cli, run_with_closed_output
+from tests.cli_helpers import process_transcript, run_cli, run_setup, run_with_closed_output
 
 
 class TestImportCost:
@@ -15,10 +14,8 @@ class TestImportCost:
             'import sg_token_broker._cli\n'
             'print(len(calls))\n'
         )
-        result = subprocess.run(
-            [sys.executable, '-c', probe], capture_output=True, text=True, check=True
-        )
-        assert result.stdout.strip() == '0'
+        result = run_setup([sys.executable, '-c', probe])
+        assert result.stdout.strip() == b'0'
 
 
 def test_closed_stdout_before_help_is_quiet() -> None:

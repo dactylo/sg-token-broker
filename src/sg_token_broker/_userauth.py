@@ -20,7 +20,12 @@ from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 import requests
 
 from sg_token_broker._credstore import load_account, load_refresh_token, store_refresh_token
-from sg_token_broker._urlpolicy import require_https_or_loopback
+from sg_token_broker._diagnostics import (
+    local_send_detail,
+    oauth_detail,
+    oauth_response_detail,
+)
+from sg_token_broker._urlpolicy import endpoint_origin, require_https_or_loopback
 
 _BROWSER_ERROR_RESPONSE = (
     b'Sign-in did not finish. You can close this tab; the program that opened it shows why.'
@@ -38,6 +43,7 @@ _REQUEST_TIMEOUT_SECONDS = 10.0
 _SCOPES = 'openid email'
 _SIGN_IN_TIMEOUT_SECONDS = 180.0
 _SUCCESS_STATUS = 200
+_WAKEUP_TIMEOUT_SECONDS = 0.25
 _WINDOWS_NOT_SOCKET_ERROR = 10038
 
 
@@ -66,8 +72,7 @@ class _CallbackServer(HTTPServer):
         self._closing = False
         self._request_lock = threading.Lock()
         self.code: str | None = None
-        self.error: str | None = None
-        self.error_description: str | None = None
+        self.refusal: str | None = None
         self._join_timeout = join_timeout
         self.state: str | None = None
         self.received = threading.Event()
@@ -102,13 +107,13 @@ class _CallbackServer(HTTPServer):
                     return
                 params = parse_qs(parts.query)
                 outer.code = params.get('code', [None])[0]
-                outer.error = params.get('error', [None])[0]
-                outer.error_description = params.get('error_description', [None])[0]
+                if 'error' in params:
+                    outer.refusal = oauth_detail(params['error'][0])
                 outer.state = params.get('state', [None])[0]
                 # The program still has to exchange the code, so never claim success here.
                 page = (
                     _BROWSER_RESPONSE
-                    if outer.code and outer.error is None
+                    if outer.code and outer.refusal is None
                     else _BROWSER_ERROR_RESPONSE
                 )
                 try:
@@ -144,7 +149,7 @@ class _CallbackServer(HTTPServer):
             self._close()
             if not isinstance(exc, Exception):
                 raise
-            raise SignInError(f'browser launch failed: {exc.__class__.__name__}') from exc
+            raise SignInError(f'browser launch failed: {exc.__class__.__name__}') from None
         if not browser_opened:
             self._close()
             raise SignInError('browser launch was rejected')
@@ -176,7 +181,7 @@ class _CallbackServer(HTTPServer):
         if self._thread.is_alive() and threading.current_thread() is not self._thread:
             self._begin_close()
             try:
-                wakeup = socket.create_connection(self._address, timeout=0.25)
+                wakeup = socket.create_connection(self._address, timeout=_WAKEUP_TIMEOUT_SECONDS)
             except OSError:
                 wakeup = None
             if wakeup is not None:
@@ -274,57 +279,27 @@ def _authorization_url(endpoint: str, query: dict[str, str]) -> str:
 
 def _discovery_document(issuer: str) -> dict[str, object]:
     """Fetch and validate an issuer's OIDC discovery document."""
+    step = f'OIDC discovery for {endpoint_origin(issuer)}'
     try:
         response = requests.get(
             f'{issuer.rstrip("/")}/.well-known/openid-configuration',
             allow_redirects=False,
             timeout=_REQUEST_TIMEOUT_SECONDS,
         )
-    except ValueError as exc:
-        raise SignInError(str(exc)) from exc
-    except requests.RequestException as exc:
-        raise SignInError(f'OIDC discovery for {issuer} failed: {exc.__class__.__name__}') from exc
+    except (ValueError, requests.RequestException) as exc:
+        raise SignInError(f'{step} failed: {type(exc).__name__}') from None
     except OSError as exc:
-        raise SignInError(f'OIDC discovery for {issuer} could not be sent: {exc}') from exc
+        raise SignInError(f'{step} could not be sent: {local_send_detail(exc, None)}') from None
     if response.status_code != _SUCCESS_STATUS:
-        raise SignInError(f'OIDC discovery for {issuer} returned {response.status_code}')
+        detail = oauth_response_detail(response)
+        raise SignInError(f'{step} returned {response.status_code}{detail}')
     try:
         document: object = response.json()
-    except ValueError as exc:
-        raise SignInError('OIDC discovery returned a non-JSON body') from exc
-    if not isinstance(document, dict):
-        raise SignInError('OIDC discovery document is not a JSON object')
-    return cast('dict[str, object]', document)
-
-
-def _raise_provider_error(callback: _CallbackServer) -> None:
-    """Raise the provider's state-valid authorization error, if any."""
-    if callback.error is None:
-        return
-    detail = f': {callback.error_description}' if callback.error_description is not None else ''
-    raise SignInError(f'authorization provider returned {callback.error}{detail}')
-
-
-def _rejection_message(response: requests.Response, operation: str, *, secret_sent: bool) -> str:
-    """Describe a token endpoint rejection, naming the client secret setting if it was missing."""
-    message = f'{operation} rejected (HTTP {response.status_code})'
-    try:
-        body: object = response.json()
     except ValueError:
-        return message
-    if not isinstance(body, dict):
-        return message
-    fields = cast('dict[str, object]', body)
-    error = fields.get('error')
-    if not isinstance(error, str):
-        return message
-    message += f': {error}'
-    description = fields.get('error_description')
-    if isinstance(description, str):
-        message += f': {description}'
-        if 'client_secret' in description and not secret_sent:
-            message += "; set SG_USER_TOKEN_CLIENT_SECRET to the OAuth client's secret"
-    return message
+        raise SignInError(f'{step} returned a non-JSON body (HTTP 200)') from None
+    if not isinstance(document, dict):
+        raise SignInError(f'{step} returned a non-object document (HTTP 200)')
+    return cast('dict[str, object]', document)
 
 
 def _post_token_endpoint(
@@ -333,8 +308,11 @@ def _post_token_endpoint(
     data: dict[str, str],
     *,
     operation: str,
+    issuer: str | None = None,
 ) -> dict[str, object]:
     """Post one token grant without redirects and require a successful JSON object."""
+    authority = issuer or token_endpoint
+    origin = endpoint_origin(authority)
     try:
         response = http.post(
             token_endpoint,
@@ -342,20 +320,25 @@ def _post_token_endpoint(
             data=data,
             timeout=_REQUEST_TIMEOUT_SECONDS,
         )
-    except requests.RequestException as exc:
-        raise SignInError(f'token endpoint unreachable: {exc.__class__.__name__}') from exc
+    except (ValueError, requests.RequestException) as exc:
+        raise SignInError(f'{operation} at {origin} failed: {type(exc).__name__}') from None
     except OSError as exc:
-        raise SignInError(f'token endpoint request could not be sent: {exc}') from exc
+        detail = local_send_detail(exc, http.verify)
+        raise SignInError(f'{operation} at {origin} could not be sent: {detail}') from None
     if response.status_code != _SUCCESS_STATUS:
-        raise SignInError(
-            _rejection_message(response, operation, secret_sent='client_secret' in data)
-        )
+        detail = oauth_response_detail(response, missing_secret='client_secret' not in data)
+        message = f'{operation} rejected (HTTP {response.status_code}) at {origin}{detail}'
+        raise SignInError(message)
     try:
         body: object = response.json()
-    except ValueError as exc:
-        raise SignInError('token endpoint returned a non-JSON body') from exc
+    except ValueError:
+        raise SignInError(
+            f'{operation} at {origin}: token endpoint returned a non-JSON body (HTTP 200)'
+        ) from None
     if not isinstance(body, dict):
-        raise SignInError('token endpoint returned a malformed body')
+        raise SignInError(
+            f'{operation} at {origin}: token endpoint returned a malformed body (HTTP 200)'
+        )
     return cast('dict[str, object]', body)
 
 
@@ -365,10 +348,10 @@ def _refresh_id_token(
     *,
     token_endpoint: str,
     client_secret: str | None = None,
-    session: requests.Session | None = None,
+    issuer: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Exchange a refresh token for a fresh ID token."""
-    http = session if session is not None else requests.Session()
+    http = requests.Session()
     data = {
         'grant_type': 'refresh_token',
         'client_id': client_id,
@@ -376,7 +359,7 @@ def _refresh_id_token(
     }
     if client_secret is not None:
         data['client_secret'] = client_secret
-    fields = _post_token_endpoint(http, token_endpoint, data, operation='refresh')
+    fields = _post_token_endpoint(http, token_endpoint, data, operation='refresh', issuer=issuer)
     id_token = fields.get('id_token')
     rotated = fields.get('refresh_token')
     return (
@@ -415,8 +398,8 @@ def credential_namespace() -> tuple[str, str]:
     client_id = os.environ.get('SG_USER_TOKEN_CLIENT_ID', '').strip()
     if not client_id:
         raise SignInSettingsError('SG_USER_TOKEN_CLIENT_ID is not set')
-    issuer = os.environ.get('SG_USER_TOKEN_ISSUER', '').strip()
-    return issuer or _GOOGLE_TOKEN_ENDPOINT, client_id
+    issuer = os.environ.get('SG_USER_TOKEN_ISSUER', '').strip() or _GOOGLE_TOKEN_ENDPOINT
+    return issuer, client_id
 
 
 def decode_unverified_payload(id_token: str) -> dict[str, object]:
@@ -439,8 +422,8 @@ def decode_unverified_payload(id_token: str) -> dict[str, object]:
         segment = parts[1]
         padded = segment + '=' * (-len(segment) % 4)
         payload: object = json.loads(base64.urlsafe_b64decode(padded))
-    except ValueError as exc:
-        raise SignInError('provider returned a malformed id_token') from exc
+    except ValueError:
+        raise SignInError('provider returned a malformed id_token') from None
     if not isinstance(payload, dict):
         raise SignInError('provider returned a malformed id_token')
     return cast('dict[str, object]', payload)
@@ -505,13 +488,17 @@ def identity_settings() -> tuple[str, str, str, str]:
             _GOOGLE_TOKEN_ENDPOINT,
         )
     try:
-        require_https_or_loopback(issuer, 'SG_USER_TOKEN_ISSUER')
+        require_https_or_loopback(
+            issuer,
+            'SG_USER_TOKEN_ISSUER',
+            credential_settings='SG_USER_TOKEN_CLIENT_ID and SG_USER_TOKEN_CLIENT_SECRET',
+        )
     except ValueError as exc:
         raise SignInSettingsError(str(exc)) from exc
     fields = _discovery_document(issuer)
     if fields.get('issuer') != issuer:
         raise SignInError(
-            f'OIDC discovery issuer {fields.get("issuer")!r} != configured {issuer!r}'
+            f'OIDC discovery for {endpoint_origin(issuer)} returned a different issuer (HTTP 200)'
         )
     auth_endpoint = fields.get('authorization_endpoint')
     token_endpoint = fields.get('token_endpoint')
@@ -520,8 +507,10 @@ def identity_settings() -> tuple[str, str, str, str]:
     for name, endpoint in (('authorization', auth_endpoint), ('token', token_endpoint)):
         try:
             require_https_or_loopback(endpoint, f'OIDC {name} endpoint')
-        except ValueError as exc:
-            raise SignInError(str(exc)) from exc
+        except ValueError:
+            raise SignInError(
+                f'OIDC discovery returned an invalid {name} endpoint (HTTP 200)'
+            ) from None
     return issuer, client_id, auth_endpoint, token_endpoint
 
 
@@ -531,6 +520,7 @@ def sign_in(  # noqa: PLR0913 - injectable public flow boundary
     authorization_endpoint: str,
     token_endpoint: str,
     client_secret: str | None = None,
+    issuer: str | None = None,
     request_offline_access: bool = True,
     open_browser: Callable[[str], object] = webbrowser.open,
     session: requests.Session | None = None,
@@ -549,6 +539,8 @@ def sign_in(  # noqa: PLR0913 - injectable public flow boundary
         token_endpoint: The provider token endpoint.
         client_secret: The installed app's client secret, sent with the code
             exchange when given. Google requires it for Desktop app clients.
+        issuer: Configured issuer for sign-in diagnostics. Defaults to the
+            endpoint origin.
         request_offline_access: Whether to request a refresh credential.
         open_browser: Callable opening the authorization URL. It must return a
             truthy value to report a successful launch.
@@ -590,7 +582,9 @@ def sign_in(  # noqa: PLR0913 - injectable public flow boundary
     callback(_authorization_url(authorization_endpoint, query), open_browser, timeout)
     if callback.state != state:
         raise SignInError('authorization response state mismatch')
-    _raise_provider_error(callback)
+    if callback.refusal is not None:
+        origin = endpoint_origin(issuer or authorization_endpoint)
+        raise SignInError(f'authorization request rejected at {origin}{callback.refusal}')
     if not callback.code:
         raise SignInError('authorization response carried no code')
     http = session if session is not None else requests.Session()
@@ -603,7 +597,9 @@ def sign_in(  # noqa: PLR0913 - injectable public flow boundary
     }
     if client_secret is not None:
         data['client_secret'] = client_secret
-    fields = _post_token_endpoint(http, token_endpoint, data, operation='code exchange')
+    fields = _post_token_endpoint(
+        http, token_endpoint, data, operation='code exchange', issuer=issuer
+    )
     id_token = fields.get('id_token')
     if not isinstance(id_token, str) or not id_token:
         raise SignInError('token endpoint returned no id_token')
@@ -647,6 +643,7 @@ class _DefaultIdTokenSource:
                 self.refresh_token,
                 token_endpoint=self.token_endpoint,
                 client_secret=self.client_secret,
+                issuer=self.issuer_key,
             )
         except SignInError:
             return self._interactive()
@@ -681,6 +678,7 @@ class _DefaultIdTokenSource:
             sign_in(
                 self.client_id,
                 authorization_endpoint=self.authorization_endpoint,
+                issuer=self.issuer_key,
                 token_endpoint=self.token_endpoint,
                 client_secret=self.client_secret,
             )

@@ -1,8 +1,10 @@
 """Load and validate broker YAML configuration."""
 
+import hashlib
 import ssl
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from types import MappingProxyType
 from typing import cast
@@ -14,12 +16,16 @@ from sg_token_broker._urlpolicy import is_loopback_host, require_https_or_loopba
 
 CLIENT_ID_MAX_CHARS = 64
 
-_CLIENT_KEYS = frozenset({'rate_limit_per_minute', 'scopes', 'secret_hash', 'token_types'})
+_CLIENT_KEYS = frozenset(
+    {'rate_limit_per_minute', 'scopes', 'secret_hash', 'secret_hashes', 'token_types'}
+)
+_CREDENTIAL_ID_LENGTH = 12
 _DEFAULTS_KEYS = frozenset({'rate_limit_per_minute', 'session_ttl_seconds', 'token_types'})
 _DEFAULT_PORT = 8743
 _DEFAULT_RATE_LIMIT_PER_MINUTE = 60
 _DEFAULT_SESSION_TTL_SECONDS = 600
 _MAX_PORT = 65535
+_MAX_SECRET_HASHES = 2
 _ROOT_KEYS = frozenset({'clients', 'defaults', 'scopes', 'server', 'site_url'})
 _SCOPE_KEYS = frozenset({'script_key_env', 'script_key_file', 'script_name'})
 _SERVER_KEYS = frozenset({'bind', 'port', 'tls'})
@@ -31,9 +37,9 @@ _TOKEN_TYPES = frozenset({'rest', 'session'})
 class _ClientConfig:
     """Configure one broker client."""
 
-    # secret_hash contains a validated serialized scrypt hash.
     client_id: str
-    secret_hash: str
+    secret_hashes: tuple[str, ...] = field(repr=False)
+    credential_ids: tuple[str, ...]
     scopes: frozenset[str]
     rate_limit_per_minute: int
     token_types: frozenset[str]
@@ -96,6 +102,11 @@ class BrokerConfig:
     session_ttl_seconds: int
     scopes: Mapping[str, ScopeConfig]
     clients: Mapping[str, _ClientConfig]
+
+    @cached_property
+    def max_secret_hashes(self) -> int:
+        """Return the number of hashes to verify on a failed authentication."""
+        return max((len(client.secret_hashes) for client in self.clients.values()), default=1)
 
 
 def _describe_yaml_error(path: Path, error: yaml.MarkedYAMLError) -> str:
@@ -195,6 +206,40 @@ def _parse_server(node: object) -> _ServerConfig:
     return _ServerConfig(bind=bind, port=port, tls=tls)
 
 
+def _validated_secret_hash(value: object, where: str) -> tuple[str, tuple[bytes, bytes]]:
+    """Return the stored text for its credential ID and the decoded record for comparison."""
+    fix = 'Use a stored hash from hash-secret.'
+    if not isinstance(value, str):
+        raise ConfigError(f'{where} must be a string. {fix}')
+    try:
+        return value, parse_secret_hash(value)
+    except SecretError as exc:
+        raise ConfigError(f'{where} is malformed. {fix}') from exc
+
+
+def _parse_secret_hashes(data: dict[str, object], where: str) -> tuple[str, ...]:
+    """Normalize the two configuration forms into an ordered tuple of distinct hashes."""
+    if ('secret_hash' in data) == ('secret_hashes' in data):
+        raise ConfigError(f'{where}: configure exactly one of secret_hash or secret_hashes')
+    if 'secret_hash' in data:
+        stored, _ = _validated_secret_hash(data['secret_hash'], f'{where}.secret_hash')
+        return (stored,)
+    node = data['secret_hashes']
+    values = cast('list[object]', node) if isinstance(node, list) else []
+    if not 1 <= len(values) <= _MAX_SECRET_HASHES:
+        raise ConfigError(f'{where}.secret_hashes must be a list of one or two stored hashes')
+    records = [
+        _validated_secret_hash(value, f'{where}.secret_hashes[{index}]')
+        for index, value in enumerate(values)
+    ]
+    # The decoder requires fixed scrypt parameters, so salt and digest identify the record.
+    if len({decoded for _, decoded in records}) != len(records):
+        raise ConfigError(
+            f'{where}.secret_hashes must contain distinct hashes. Remove the duplicate.'
+        )
+    return tuple(stored for stored, _ in records)
+
+
 def is_credential_text(value: str) -> bool:
     """Return True if `value` is non-empty and every character is in 0x21-0x7E.
 
@@ -236,13 +281,7 @@ def _parse_client(
         )
     data = _require_mapping(node, f'clients.{client_id}')
     _reject_unknown_keys(data, f'clients.{client_id}', _CLIENT_KEYS)
-    secret_hash = data.get('secret_hash')
-    if not isinstance(secret_hash, str):
-        raise ConfigError(f'clients.{client_id}.secret_hash is required')
-    try:
-        parse_secret_hash(secret_hash)
-    except SecretError as exc:
-        raise ConfigError(f'clients.{client_id}.secret_hash is malformed') from exc
+    secret_hashes = _parse_secret_hashes(data, f'clients.{client_id}')
     raw_scopes = data.get('scopes')
     if not isinstance(raw_scopes, list) or not raw_scopes:
         raise ConfigError(f'clients.{client_id}.scopes must be a non-empty list')
@@ -261,7 +300,11 @@ def _parse_client(
     )
     return _ClientConfig(
         client_id=client_id,
-        secret_hash=secret_hash,
+        secret_hashes=secret_hashes,
+        credential_ids=tuple(
+            hashlib.sha256(value.encode()).hexdigest()[:_CREDENTIAL_ID_LENGTH]
+            for value in secret_hashes
+        ),
         scopes=frozenset(scope_names),
         rate_limit_per_minute=rate,
         token_types=token_types,
@@ -295,7 +338,9 @@ def load_config(path: Path) -> BrokerConfig:
     if not isinstance(site_url, str):
         raise ConfigError('site_url must be an https URL string')
     try:
-        require_https_or_loopback(site_url, 'site_url')
+        require_https_or_loopback(
+            site_url, 'site_url', credential_settings='script_key_env or script_key_file'
+        )
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
 

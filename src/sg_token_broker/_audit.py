@@ -4,13 +4,15 @@ import datetime
 import json
 import logging
 
+from sg_token_broker._servicelog import ServiceWriter
+
 _AUDIT_LOGGER_NAME = 'sg_token_broker.audit'
 
 
 class AuditLogger:
     """Write audit events as JSON lines via standard logging."""
 
-    def __init__(self, logger: logging.Logger | None = None) -> None:
+    def __init__(self, logger: logging.Logger | ServiceWriter | None = None) -> None:
         """Select the logger that receives structured audit events.
 
         Args:
@@ -30,4 +32,7 @@ class AuditLogger:
             **fields,
             'event': event,
         }
-        self._logger.info(json.dumps(record, sort_keys=True, default=str))
+        # For issuance, denial and error (including parser rejections), both HTTP services
+        # attempt this write and flush before the first byte of the final response. Healthy
+        # probes, interim 100s and listener refusals have no audit. The sink owns retention.
+        self._logger.log(logging.INFO, json.dumps(record, sort_keys=True, default=str))

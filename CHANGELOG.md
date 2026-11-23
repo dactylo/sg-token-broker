@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.3.0 (2026-11-22)
+
+### Breaking changes
+
+- In code and audit alerts, replace `upstream_error` with `sg_rejected` or `sg_invalid_response`
+  (both 502), or `upstream_unavailable` (503).
+- Replace `ClientOptions` with keyword arguments to `BrokerClient`.
+
+### Added
+
+- Thousands of machines can request the same token at once. On 503s, the Python clients and token
+  commands honor `Retry-After` for up to `max_wait` (`--max-wait`, default 300 seconds).
+- After you upgrade every broker, replace `secret_hash` with `secret_hashes` containing the old and
+  new hashes. The audit log's `credential` field shows which secret was used.
+- After you upgrade every broker, replace a token SG rejected with
+  `BrokerClient.fetch_token(scope, rejected_token=token)` or pipe it to
+  `get-token --replace-rejected`.
+- Use the [nginx example](docs/reverse-proxy.conf) to proxy multiple brokers.
+- [Migrate `shotgun_api3` code off script keys](docs/migrating.md).
+
+### Changed
+
+- Only token requests sent to SG count toward `rate_limit_per_minute`.
+- Set `SuccessExitStatus=130 143` in the broker and user-token service systemd units so stops count
+  as successful.
+
+### Fixed
+
+- The container now shuts down promptly.
+
+### Security
+
+- User-token audit logs now omit SG and identity-provider error text.
+
 ## 0.2.0 (2026-11-08)
 
 ### Breaking changes

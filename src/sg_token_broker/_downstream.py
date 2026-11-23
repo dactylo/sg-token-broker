@@ -142,3 +142,8 @@ def closable_stdout() -> Generator[_ClosableTextOutput, None, None]:
                 # The interpreter still flushes a stream without a descriptor
                 # at shutdown, so replace it with one that cannot fail.
                 sys.stdout = _null_text_stream()
+
+
+def discard_closed_output(stream: TextIO) -> TextIO:
+    """Wrap a private output stream to discard further writes once its reader closes."""
+    return cast('TextIO', _ClosableTextOutput(stream))

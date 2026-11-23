@@ -6,7 +6,6 @@ class TestPublicAPI:
         assert set(sg_token_broker.__all__) == {
             'BrokerClient',
             'BrokerClientError',
-            'ClientOptions',
             'TokenResponse',
             'UserToken',
             'UserTokenClient',

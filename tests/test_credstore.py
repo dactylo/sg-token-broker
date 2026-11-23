@@ -90,10 +90,27 @@ class TestCredStore:
         backend = _MemoryKeyring()
         keyring.backend = backend
         monkeypatch.setattr(_credstore, '_backend_is_secure', _secure)
-        store_refresh_token('https://idp-a', 'client-1', 'jane', 'rt-a')
-        store_refresh_token('https://idp-b', 'client-1', 'jane', 'rt-b')
-        assert load_refresh_token('https://idp-a', 'client-1', 'jane') == 'rt-a'
-        assert load_refresh_token('https://idp-b', 'client-1', 'jane') == 'rt-b'
+        primary = ('https://idp-a', 'client-1')
+        other_issuer = ('https://idp-b', 'client-1')
+        other_client = ('https://idp-a', 'client-2')
+        for identity, account in [(primary, 'old'), (other_issuer, 'b'), (other_client, 'c')]:
+            assert store_account(*identity, account)
+            assert store_refresh_token(*identity, 'old', account)
+        assert store_account(*primary, 'new')
+        assert store_refresh_token(*primary, 'new', 'initial')
+        assert load_refresh_token(*primary, 'new') == 'initial'
+        assert store_refresh_token(*primary, 'new', 'rotated')
+        assert load_refresh_token(*primary, 'new') == 'rotated'
+        assert load_account(*primary) == 'new'
+        assert load_refresh_token(*primary, 'old') == 'old'
+        assert delete_refresh_token(*primary, 'old')
+        assert delete_account(*primary)
+        assert load_refresh_token(*primary, 'old') is None
+        assert load_refresh_token(*primary, 'new') == 'rotated'
+        assert load_account(*primary) is None
+        for identity, account in [(other_issuer, 'b'), (other_client, 'c')]:
+            assert load_account(*identity) == account
+            assert load_refresh_token(*identity, 'old') == account
 
     def test_round_trip_with_approved_backend(
         self, keyring: _FakeKeyringModule, monkeypatch: pytest.MonkeyPatch

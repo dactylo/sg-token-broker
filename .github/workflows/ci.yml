@@ -137,7 +137,8 @@ jobs:
         run: git diff --exit-code
   test:
     needs: quality
-    timeout-minutes: 60
+    # Leave room for several 15-minute test timeouts to reach pytest's failure summary.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -174,6 +175,42 @@ jobs:
           if [ "$CI_HOSTED" = true ]; then
             test "$CI_RUNNER_ENVIRONMENT" = github-hosted
           fi
+      - name: Report machine before tests
+        env:
+          CI_RUNNER_OS: ${{ runner.os }}
+        run: |
+          # Diagnostics only; the "|| true" keeps any failed command from failing the job.
+          {
+            if [ "$CI_RUNNER_OS" = macOS ]; then
+              printf 'Cores: %s\n' "$(sysctl -n hw.ncpu)"
+              printf 'Memory: %s bytes\n' "$(sysctl -n hw.memsize)"
+              printf 'CPU: %s\n' "$(sysctl -n machdep.cpu.brand_string)"
+              printf 'OS: macOS %s\n' "$(sw_vers -productVersion)"
+              vm_stat
+              ps -Ao pcpu,pmem,etime,command -r | head -15
+              uptime
+            elif [ "$CI_RUNNER_OS" = Windows ]; then
+              powershell -NoProfile -Command '
+                $os = Get-CimInstance Win32_OperatingSystem
+                $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+                "Cores: $([Environment]::ProcessorCount)"
+                "Memory: $($os.TotalVisibleMemorySize) KiB; free: $($os.FreePhysicalMemory) KiB"
+                "CPU: $($cpu.Name); load: $($cpu.LoadPercentage)%"
+                "OS: $($os.Caption) $($os.Version)"
+                Get-Process | Sort-Object CPU -Descending |
+                  Select-Object -First 15 Name, Id, CPU, WorkingSet64 | Format-Table -AutoSize
+              '
+            else
+              printf 'Cores: %s\n' "$(nproc)"
+              grep -E 'MemTotal|MemAvailable|SwapFree' /proc/meminfo
+              grep -m1 'model name' /proc/cpuinfo
+              printf 'OS: %s\n' "$(uname -sr)"
+              ps -Ao pcpu,pmem,etime,args --sort=-pcpu | head -15
+              uptime
+            fi
+            df -h .
+            printf 'Open files limit: %s; processes limit: %s\n' "$(ulimit -n)" "$(ulimit -u)"
+          } || true
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -221,7 +258,45 @@ jobs:
           if [ "$CI_QUICK_TESTS" = true ]; then
             selection=(-m 'not slow')
           fi
-          python -m pytest -q -n auto --dist worksteal --durations=15 "${selection[@]}"
+          # -vv outweighs the configured -q, so each test's result is logged as it finishes.
+          python -m pytest -vv -n auto --dist worksteal --durations=15 "${selection[@]}"
+      - name: Report machine after tests
+        if: always()
+        env:
+          CI_RUNNER_OS: ${{ runner.os }}
+        run: |
+          # Diagnostics only; the "|| true" keeps any failed command from failing the job.
+          {
+            if [ "$CI_RUNNER_OS" = macOS ]; then
+              printf 'Cores: %s\n' "$(sysctl -n hw.ncpu)"
+              printf 'Memory: %s bytes\n' "$(sysctl -n hw.memsize)"
+              printf 'CPU: %s\n' "$(sysctl -n machdep.cpu.brand_string)"
+              printf 'OS: macOS %s\n' "$(sw_vers -productVersion)"
+              vm_stat
+              ps -Ao pcpu,pmem,etime,command -r | head -15
+              uptime
+            elif [ "$CI_RUNNER_OS" = Windows ]; then
+              powershell -NoProfile -Command '
+                $os = Get-CimInstance Win32_OperatingSystem
+                $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+                "Cores: $([Environment]::ProcessorCount)"
+                "Memory: $($os.TotalVisibleMemorySize) KiB; free: $($os.FreePhysicalMemory) KiB"
+                "CPU: $($cpu.Name); load: $($cpu.LoadPercentage)%"
+                "OS: $($os.Caption) $($os.Version)"
+                Get-Process | Sort-Object CPU -Descending |
+                  Select-Object -First 15 Name, Id, CPU, WorkingSet64 | Format-Table -AutoSize
+              '
+            else
+              printf 'Cores: %s\n' "$(nproc)"
+              grep -E 'MemTotal|MemAvailable|SwapFree' /proc/meminfo
+              grep -m1 'model name' /proc/cpuinfo
+              printf 'OS: %s\n' "$(uname -sr)"
+              ps -Ao pcpu,pmem,etime,args --sort=-pcpu | head -15
+              uptime
+            fi
+            df -h .
+            printf 'Open files limit: %s; processes limit: %s\n' "$(ulimit -n)" "$(ulimit -u)"
+          } || true
 
   package:
     needs: [quality, test]
@@ -282,8 +357,11 @@ jobs:
           }
 
           with zipfile.ZipFile(wheels[0]) as archive:
+              assert 'sg_token_broker/py.typed' in archive.namelist(), archive.filename
               archives = [(archive.filename, archive.namelist(), False)]
           with tarfile.open(sdists[0], 'r:gz') as archive:
+              root = sdists[0].name.removesuffix('.tar.gz')
+              assert f'{root}/src/sg_token_broker/py.typed' in archive.getnames(), archive.name
               archives.append((archive.name, archive.getnames(), True))
 
           for archive_name, names, strip_sdist_root in archives:

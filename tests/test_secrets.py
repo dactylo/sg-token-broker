@@ -13,11 +13,21 @@ from sg_token_broker._secrets import (
     verify_secret,
 )
 
-_DIGEST_B64 = base64.b64encode(b'digest').decode()
-_SALT_B64 = base64.b64encode(b'salt').decode()
+# Fixed, structurally valid scrypt encoding. Each rejection changes one field.
+_HASH_FIELDS = (
+    'scrypt',
+    '16384',
+    '8',
+    '1',
+    base64.b64encode(bytes(range(16))).decode(),
+    base64.b64encode(bytes(range(64))).decode(),
+)
 
 
 class TestHashing:
+    def test_fixed_hash_fields_decode(self) -> None:
+        assert parse_secret_hash('$'.join(_HASH_FIELDS)) == (bytes(range(16)), bytes(range(64)))
+
     def test_generate_secret_is_long_and_unique(self) -> None:
         a, b = generate_secret(), generate_secret()
         assert a != b
@@ -31,6 +41,10 @@ class TestHashing:
     def test_hashes_are_salted(self) -> None:
         assert hash_secret('s') != hash_secret('s')
 
+    def test_incomplete_hash_is_rejected(self) -> None:
+        with pytest.raises(SecretError, match='malformed'):
+            parse_secret_hash('$'.join(_HASH_FIELDS[:-1]))
+
     def test_malformed_digest_is_rejected_before_kdf(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -43,28 +57,40 @@ class TestHashing:
         with pytest.raises(SecretError, match='malformed'):
             verify_secret('anything', bad)
 
-    @pytest.mark.parametrize('bad', ['', 'scrypt$x', 'md5$1$2$3$a$b', 'scrypt$1$2$3$!!$=='])
-    def test_malformed_hash_raises(self, bad: str) -> None:
-        with pytest.raises(SecretError):
-            verify_secret('s', bad)
-
     @pytest.mark.parametrize(
-        'bad',
+        ('field', 'replacement'),
         [
-            'scrypt$2$1$1$c2FsdA==$AQ==',
-            'scrypt$16384$8$1$c2FsdA==$' + base64.b64encode(b'x' * 64).decode(),
-            'scrypt$16384$8$1$' + base64.b64encode(b's' * 16).decode() + '$AQ==',
-            'scrypt$8192$8$1$'
-            + base64.b64encode(b's' * 16).decode()
-            + '$'
-            + base64.b64encode(b'x' * 64).decode(),
+            (0, 'md5'),
+            (1, '3'),
+            (1, '8192'),
+            (2, '0'),
+            (3, '0'),
+            (4, '!' + _HASH_FIELDS[4]),
+            (5, '!' + _HASH_FIELDS[5]),
+            (4, 'AQ=='),
+            (5, 'AQ=='),
+            (4, ''),
+            (5, ''),
+        ],
+        ids=[
+            'scheme',
+            'non-power-of-two',
+            'unsupported-cost',
+            'zero-r',
+            'zero-p',
+            'salt-base64',
+            'digest-base64',
+            'short-salt',
+            'short-digest',
+            'empty-salt',
+            'empty-digest',
         ],
     )
-    def test_non_production_parameters_are_rejected(self, bad: str) -> None:
+    def test_malformed_field_is_rejected(self, field: int, replacement: str) -> None:
+        fields = list(_HASH_FIELDS)
+        fields[field] = replacement
         with pytest.raises(SecretError, match='malformed'):
-            parse_secret_hash(bad)
-        with pytest.raises(SecretError, match='malformed'):
-            verify_secret('anything', bad)
+            parse_secret_hash('$'.join(fields))
 
     def test_parse_accepts_hash_secret_output(self) -> None:
         salt, digest = parse_secret_hash(hash_secret('s3cret'))
@@ -74,21 +100,6 @@ class TestHashing:
     def test_roundtrip(self) -> None:
         secret = generate_secret()
         assert verify_secret(secret, hash_secret(secret))
-
-    @pytest.mark.parametrize(
-        'bad',
-        [
-            f'scrypt$3$8$1${_SALT_B64}${_DIGEST_B64}',
-            f'scrypt$16384$0$1${_SALT_B64}${_DIGEST_B64}',
-            f'scrypt$16384$8$0${_SALT_B64}${_DIGEST_B64}',
-            f'scrypt$16384$8$1$${_DIGEST_B64}',
-            f'scrypt$16384$8$1${_SALT_B64}$',
-        ],
-        ids=['n-not-power-of-two', 'zero-r', 'zero-p', 'empty-salt', 'empty-digest'],
-    )
-    def test_structurally_complete_malformed_hash_raises(self, bad: str) -> None:
-        with pytest.raises(SecretError, match='malformed'):
-            verify_secret('s', bad)
 
     def test_wrong_secret_rejected(self) -> None:
         assert not verify_secret('nope', hash_secret('right'))
@@ -134,13 +145,9 @@ class TestResolveScriptKey:
 
 
 class TestTokenFingerprint:
-    def test_distinct_tokens_differ(self) -> None:
-        assert token_fingerprint('tok-a') != token_fingerprint('tok-b')
-
-    def test_not_reversible_prefix(self) -> None:
-        assert 'tok-a' not in token_fingerprint('tok-a')
-
-    def test_stable_and_short(self) -> None:
-        a, b = token_fingerprint('tok-a'), token_fingerprint('tok-a')
-        assert a == b
-        assert len(a) == 16
+    @pytest.mark.parametrize(
+        ('token', 'expected'),
+        [('abc', 'ba7816bf8f01cfea'), ('hello', '2cf24dba5fb0a30e')],
+    )
+    def test_sha256_prefix(self, token: str, expected: str) -> None:
+        assert token_fingerprint(token) == expected

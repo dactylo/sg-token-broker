@@ -28,6 +28,8 @@ class TestOidcClaimsValidator:
     def test_assume_email_verified_override(self) -> None:
         payload = _payload()
         del payload['email_verified']
+        with pytest.raises(ClaimsError, match='verified'):
+            _validator(payload=payload).validate('Bearer t')
         claims = _validator(payload=payload, assume_email_verified=True).validate('Bearer t')
         assert claims.email == 'jane@studio.example'
 
@@ -65,11 +67,9 @@ class TestOidcClaimsValidator:
         with pytest.raises(ClaimsError, match='azp'):
             _validator(payload=payload).validate('Bearer t')
 
-    def test_rejects_azp_absent_from_the_token_audiences(self) -> None:
-        # Both client-1 and client-2 are configured; the token's aud
-        # satisfies client-1 but its azp names client-2. One client must
-        # satisfy both checks.
-        payload = _payload(aud=['client-1', 'other'], azp='client-2')
+    @pytest.mark.parametrize('azp', ['client-2', 'other'], ids=['outside-token', 'outside-config'])
+    def test_rejects_azp_outside_matched_audiences(self, azp: str) -> None:
+        payload = _payload(aud=['client-1', 'other'], azp=azp)
         with pytest.raises(ClaimsError, match='azp'):
             _validator(payload=payload).validate('Bearer t')
 

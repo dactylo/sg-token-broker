@@ -5,13 +5,17 @@ import socket
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from functools import partial
+from http.client import HTTPResponse
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
+from queue import Queue
 from types import SimpleNamespace
 from typing import Protocol
 from unittest.mock import Mock
@@ -29,12 +33,16 @@ from sg_token_broker._userauth import (
     account_from_id_token,
     default_id_token_source,
     identity_settings,
-    sign_in,
 )
+from tests._timeouts import STALL_TIMEOUT_SECONDS
 
+_CALLBACK_REQUEST_TIMEOUT_SECONDS = userauth._REQUEST_TIMEOUT_SECONDS
+_CALLBACK_WAKEUP_TIMEOUT_SECONDS = userauth._WAKEUP_TIMEOUT_SECONDS
 # Stored Google sign-ins live under this keyring issuer; changing it orphans them.
 _GOOGLE_KEYRING_ISSUER = 'https://oauth2.googleapis.com/token'
 _PROVIDER_ENDPOINT = 'https://idp.example/token'
+
+_sign_in = partial(userauth.sign_in, timeout=STALL_TIMEOUT_SECONDS)
 
 
 class TestAccountFromIdToken:
@@ -49,8 +57,9 @@ class TestAccountFromIdToken:
 
 
 class TestIdentitySettings:
-    def test_discovered_settings_lead_with_the_issuer(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize('invalid_endpoint', [None, 'authorization', 'token'])
+    def test_discovered_settings_validate_endpoints(
+        self, monkeypatch: pytest.MonkeyPatch, invalid_endpoint: str | None
     ) -> None:
         monkeypatch.setenv('SG_USER_TOKEN_CLIENT_ID', 'client-1')
         monkeypatch.setenv('SG_USER_TOKEN_ISSUER', 'https://idp.example')
@@ -61,6 +70,12 @@ class TestIdentitySettings:
         }
         response = Mock(status_code=200, json=Mock(return_value=document))
         monkeypatch.setattr(requests, 'get', Mock(return_value=response))
+
+        if invalid_endpoint is not None:
+            document[f'{invalid_endpoint}_endpoint'] = 'http://idp.example/unsafe'
+            with pytest.raises(SignInError, match=f'invalid {invalid_endpoint} endpoint'):
+                identity_settings()
+            return
 
         assert identity_settings() == (
             'https://idp.example',
@@ -84,12 +99,6 @@ class TestIdentitySettings:
             identity_settings()
 
         assert get.call_args.kwargs['allow_redirects'] is False
-
-    def test_unreachable_issuer_is_a_sign_in_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv('SG_USER_TOKEN_CLIENT_ID', 'client-1')
-        monkeypatch.setenv('SG_USER_TOKEN_ISSUER', 'https://127.0.0.1:1')
-        with pytest.raises(SignInError, match='discovery'):
-            identity_settings()
 
 
 class _Browser:
@@ -262,6 +271,7 @@ class TestDefaultIdTokenSource:
             authorization_endpoint=fake_provider.authorization_endpoint,
             token_endpoint=fake_provider.token_endpoint,
             client_secret=None,
+            issuer=_GOOGLE_KEYRING_ISSUER,
         )
         assert fake_provider.token_form['grant_type'] == ['refresh_token']
         assert 'client_secret' not in fake_provider.token_form
@@ -487,12 +497,16 @@ class TestDefaultIdTokenSource:
 
     @pytest.mark.parametrize('earlier_sign_in', [False, True])
     def test_removed_credential_reauthenticates_once_then_reuses_until_expiry(
-        self, monkeypatch: _CallablePatcher, earlier_sign_in: bool
+        self, monkeypatch: pytest.MonkeyPatch, earlier_sign_in: bool
     ) -> None:
         now = [1_700_000_000]
-        monkeypatch.setattr(userauth.time, 'time', lambda: now[0])
+        monkeypatch.setattr(userauth, 'time', SimpleNamespace(time=lambda: now[0]))
         stored: list[str | None] = ['rt-old']
-        monkeypatch.setattr(userauth, 'load_refresh_token', lambda *_args: stored[0])
+
+        def load_refresh_token(*_args: object) -> str | None:
+            return stored[0]
+
+        monkeypatch.setattr(userauth, 'load_refresh_token', load_refresh_token)
         tokens = [
             _id_token({'email': 'jane@s.example', 'exp': now[0] + lifetime})
             for lifetime in (4000, 3600, 7200, 8000)
@@ -552,6 +566,88 @@ class TestDefaultIdTokenSource:
 
         assert [source(), source()] == [token, token]
         assert len(calls) == sign_ins
+
+
+class _CallbackReads:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._monkeypatch = monkeypatch
+        self.reads: Queue[threading.Event | None] = Queue()
+        self._gates: list[threading.Event] = []
+        self._released = False
+        self.errors: list[BaseException] = []
+        self._closed_at_join: list[bool] = []
+        original_read = socket.SocketIO.readinto
+        outer = self
+
+        class Callback(userauth._CallbackServer):
+            def _serve_until_callback(self) -> None:
+                try:
+                    super()._serve_until_callback()
+                finally:
+                    error = sys.exception()
+                    if error is not None:
+                        outer.errors.append(error)
+                    outer.reads.put(None)
+
+        def read(reader: socket.SocketIO, buffer: bytearray) -> int | None:
+            if threading.current_thread() is self.callback._thread and not self._released:
+                gate = threading.Event()
+                self._gates.append(gate)
+                self.reads.put(gate)
+                gate.wait()
+            return original_read(reader, buffer)
+
+        monkeypatch.setattr(socket.SocketIO, 'readinto', read)
+        self.callback = Callback()
+
+    def assert_closed_before_join(self) -> None:
+        assert self._closed_at_join == [True], 'active callback socket was not closed before join'
+        assert not self.callback._thread.is_alive()
+        assert not self.errors
+
+    def next_read(self) -> threading.Event:
+        gate = self.reads.get()
+        assert not self.errors
+        assert gate is not None, 'callback thread exited before its next socket read'
+        return gate
+
+    def release(self) -> None:
+        self._released = True
+        for gate in self._gates:
+            gate.set()
+
+    def observe_close(self, client: socket.socket) -> None:
+        request = self.callback._active_request
+        assert request is not None
+        shutdowns: list[socket.socket] = []
+        closes: list[socket.socket] = []
+        original_shutdown = socket.socket.shutdown
+        original_close = socket.socket.close
+        original_join = self.callback._thread.join
+
+        def shutdown(sock: socket.socket, how: int) -> None:
+            if sock is request and how == socket.SHUT_RDWR:
+                shutdowns.append(sock)
+            original_shutdown(sock, how)
+
+        def close(sock: socket.socket) -> None:
+            if sock is request:
+                closes.append(sock)
+            original_close(sock)
+
+        def join(timeout: float | None = None) -> None:
+            del timeout
+            self._closed_at_join.append(request in shutdowns and request in closes)
+            # Release even a defective implementation, then assert the recorded cause.
+            # This lets a missing socket interruption fail without the hang backstop.
+            with suppress(OSError):
+                original_shutdown(client, socket.SHUT_RDWR)
+            self.release()
+            original_join()
+
+        self._monkeypatch.setattr(socket.socket, 'shutdown', shutdown)
+        self._monkeypatch.setattr(socket.socket, 'close', close)
+        self._monkeypatch.setattr(self.callback._thread, 'join', join)
 
 
 class _FakeProvider(_Browser):
@@ -625,7 +721,7 @@ class TestMalformedTokenEndpoint:
             )
         else:
             exchange = partial(
-                sign_in,
+                _sign_in,
                 'client-1',
                 authorization_endpoint=fake_provider.authorization_endpoint,
                 token_endpoint=fake_provider.token_endpoint,
@@ -649,7 +745,11 @@ class TestMalformedTokenEndpoint:
                 operation='refresh',
             )
 
-        assert str(caught.value) == 'refresh rejected (HTTP 400): invalid_grant: Bad Request'
+        assert str(caught.value).startswith(
+            'refresh rejected (HTTP 400) at https://idp.example: invalid_grant'
+        )
+        assert 'sign in again' in str(caught.value)
+        assert 'Bad Request' not in str(caught.value)
 
 
 class TestRefreshIdToken:
@@ -679,9 +779,8 @@ class TestRefreshIdToken:
     def test_refresh_exchange_disables_redirects(self, monkeypatch: pytest.MonkeyPatch) -> None:
         response = requests.Response()
         response.status_code = 307
-        session = requests.Session()
         post = Mock(return_value=response)
-        monkeypatch.setattr(session, 'post', post)
+        monkeypatch.setattr(requests.Session, 'post', post)
         endpoint = 'https://idp.example/token'
 
         with pytest.raises(SignInError, match='HTTP 307'):
@@ -689,7 +788,6 @@ class TestRefreshIdToken:
                 'client-1',
                 'rt-1',
                 token_endpoint=endpoint,
-                session=session,
             )
 
         assert post.call_args.kwargs['allow_redirects'] is False
@@ -698,11 +796,16 @@ class TestRefreshIdToken:
         fake_provider.refresh_response = {'id_token': 'idt-2', 'refresh_token': 'rt-2'}
         result = _refresh_id_token('client-1', 'rt-1', token_endpoint=fake_provider.token_endpoint)
         assert result == ('idt-2', 'rt-2')
+        assert fake_provider.token_form == {
+            'grant_type': ['refresh_token'],
+            'client_id': ['client-1'],
+            'refresh_token': ['rt-1'],
+        }
 
 
 class TestSignIn:
     def test_authorization_endpoint_query_is_preserved(self, fake_provider: _FakeProvider) -> None:
-        sign_in(
+        _sign_in(
             'client-1',
             authorization_endpoint=f'{fake_provider.authorization_endpoint}?tenant=studio',
             token_endpoint=fake_provider.token_endpoint,
@@ -715,7 +818,7 @@ class TestSignIn:
 
     def test_callback_is_one_shot(self, fake_provider: _FakeProvider) -> None:
         fake_provider.second_callback_rejected = True
-        bundle = sign_in(
+        bundle = _sign_in(
             'client-1',
             authorization_endpoint=fake_provider.authorization_endpoint,
             token_endpoint=fake_provider.token_endpoint,
@@ -735,7 +838,7 @@ class TestSignIn:
             return True
 
         with pytest.raises(SignInError, match='access_denied'):
-            sign_in(
+            _sign_in(
                 'client-1',
                 authorization_endpoint=fake_provider.authorization_endpoint,
                 token_endpoint=fake_provider.token_endpoint,
@@ -754,7 +857,7 @@ class TestSignIn:
             pages.append(page)
             return True
 
-        sign_in(
+        _sign_in(
             'client-1',
             authorization_endpoint=fake_provider.authorization_endpoint,
             token_endpoint=fake_provider.token_endpoint,
@@ -766,19 +869,22 @@ class TestSignIn:
     def test_callback_response_failure_still_completes(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def fail_response(_handler: BaseHTTPRequestHandler) -> None:
-            raise BrokenPipeError
+        callback = userauth._CallbackServer()
+        original_flush = BaseHTTPRequestHandler.flush_headers
+
+        def fail_response(handler: BaseHTTPRequestHandler) -> None:
+            if handler.server is callback:
+                raise BrokenPipeError
+            original_flush(handler)
 
         monkeypatch.setattr(BaseHTTPRequestHandler, 'flush_headers', fail_response)
-        callback = userauth._CallbackServer()
         try:
             host, port = callback._address
             with pytest.raises(requests.ConnectionError):
                 requests.get(
                     f'http://{host}:{port}/callback?code=ok&state=expected',
-                    timeout=1,
                 )
-            callback._thread.join(timeout=1)
+            callback._thread.join()
             assert (
                 callback.code,
                 callback.state,
@@ -789,22 +895,43 @@ class TestSignIn:
             callback._close()
 
     def test_close_is_bounded_when_the_wakeup_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        callback = userauth._CallbackServer(join_timeout=0.05)
+        monkeypatch.setattr(userauth, '_WAKEUP_TIMEOUT_SECONDS', _CALLBACK_WAKEUP_TIMEOUT_SECONDS)
+        # No real serving thread is needed to verify the bound passed to join.
+        callback = _StoppedCallback(join_timeout=userauth._JOIN_TIMEOUT_SECONDS)
+        callback._thread.join()
+        thread = Mock(is_alive=Mock(return_value=True))
+        monkeypatch.setattr(callback, '_thread', thread)
+        wakeup = Mock(side_effect=TimeoutError('injected wakeup deadline'))
+        original_connect = socket.create_connection
 
-        def refuse(*_args: object, **_kwargs: object) -> socket.socket:
-            raise OSError('wakeup refused')
+        def connect(
+            address: tuple[str, int],
+            timeout: float | None = None,
+            source_address: tuple[str, int] | None = None,
+            *,
+            all_errors: bool = False,
+        ) -> socket.socket:
+            if address == callback._address:
+                return wakeup(address, timeout=timeout)
+            return original_connect(address, timeout, source_address, all_errors=all_errors)
 
-        monkeypatch.setattr(userauth.socket, 'create_connection', refuse)
-        started = time.monotonic()
+        monkeypatch.setattr(socket, 'create_connection', connect)
+        expired_wait = Mock(return_value=False)
+        monkeypatch.setattr(callback.received, 'wait', expired_wait)
+
         with pytest.raises(SignInError, match='timed out'):
-            callback._wait(0.05)
-        assert time.monotonic() - started < 1.0
+            callback._wait(userauth._SIGN_IN_TIMEOUT_SECONDS)
+
+        expired_wait.assert_called_once_with(userauth._SIGN_IN_TIMEOUT_SECONDS)
+        thread.join.assert_called_once_with(userauth._JOIN_TIMEOUT_SECONDS)
+        wakeup.assert_called_once_with(callback._address, timeout=0.25)
+        assert callback.socket.fileno() == -1
 
     @pytest.mark.parametrize(('secret', 'sent'), [(None, []), ('secret-1', ['secret-1'])])
     def test_code_exchange_sends_client_secret_only_when_configured(
         self, fake_provider: _FakeProvider, secret: str | None, sent: list[str]
     ) -> None:
-        sign_in(
+        _sign_in(
             'client-1',
             authorization_endpoint=fake_provider.authorization_endpoint,
             token_endpoint=fake_provider.token_endpoint,
@@ -833,16 +960,15 @@ class TestSignIn:
             return result
 
         with pytest.raises(SignInError, match='browser launch'):
-            sign_in(
+            _sign_in(
                 'client-1',
                 authorization_endpoint='https://idp.example/authorize',
                 token_endpoint=_PROVIDER_ENDPOINT,
                 open_browser=rejected_browser,
-                timeout=0.01,
             )
         assert callback_threads
         for thread in callback_threads:
-            thread.join(0.25)
+            thread.join()
         assert not any(thread.is_alive() for thread in callback_threads)
         parts = urlsplit(redirect_uri)
         assert parts.hostname is not None
@@ -873,8 +999,20 @@ class TestSignIn:
             userauth, 'sys', SimpleNamespace(platform=platform, exception=sys.exception)
         )
         reported = Mock()
-        monkeypatch.setattr(HTTPServer, 'handle_error', reported)
         callback = userauth._CallbackServer()
+        original_error = HTTPServer.handle_error
+
+        def handle_error(
+            server: HTTPServer,
+            request: socket.socket | tuple[bytes, socket.socket],
+            address: object,
+        ) -> None:
+            if server is callback:
+                reported(request, address)
+            else:
+                original_error(server, request, address)
+
+        monkeypatch.setattr(HTTPServer, 'handle_error', handle_error)
         try:
             callback._closing = closing
             with socket.socket() as request:
@@ -900,7 +1038,7 @@ class TestSignIn:
         endpoint = 'https://idp.example/token'
 
         with pytest.raises(SignInError, match='HTTP 307'):
-            sign_in(
+            _sign_in(
                 'client-1',
                 authorization_endpoint=browser.authorization_endpoint,
                 token_endpoint=endpoint,
@@ -911,7 +1049,7 @@ class TestSignIn:
         assert post.call_args.kwargs['allow_redirects'] is False
 
     def test_full_pkce_flow(self, fake_provider: _FakeProvider) -> None:
-        bundle = sign_in(
+        bundle = _sign_in(
             'client-1',
             authorization_endpoint=fake_provider.authorization_endpoint,
             token_endpoint=fake_provider.token_endpoint,
@@ -928,11 +1066,13 @@ class TestSignIn:
         expected = base64.urlsafe_b64encode(digest).rstrip(b'=').decode('ascii')
         assert auth_query['code_challenge'] == [expected]
         assert fake_provider.token_form['grant_type'] == ['authorization_code']
+        assert fake_provider.token_form['client_id'] == ['client-1']
+        assert fake_provider.token_form['redirect_uri'] == auth_query['redirect_uri']
 
     def test_google_endpoints_use_google_offline_parameters(
         self, fake_provider: _FakeProvider
     ) -> None:
-        sign_in(
+        _sign_in(
             'client-1',
             authorization_endpoint=_GOOGLE_AUTHORIZATION_ENDPOINT,
             token_endpoint=fake_provider.token_endpoint,
@@ -946,26 +1086,46 @@ class TestSignIn:
     def test_idle_connection_times_out_without_consuming_callback(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(userauth, '_REQUEST_TIMEOUT_SECONDS', 0.05)
+        monkeypatch.setattr(
+            userauth, '_REQUEST_TIMEOUT_SECONDS', _CALLBACK_REQUEST_TIMEOUT_SECONDS
+        )
+        original_read = socket.SocketIO.readinto
+        timed_out: list[float | None] = []
         callback = userauth._CallbackServer()
-        idle = socket.create_connection(callback._address, timeout=1)
+
+        def timeout_idle_read(reader: socket.SocketIO, buffer: bytearray) -> int | None:
+            if threading.current_thread() is callback._thread and not timed_out:
+                request = callback._active_request
+                timed_out.append(request.gettimeout() if request is not None else None)
+                raise TimeoutError('idle callback read expired')
+            return original_read(reader, buffer)
+
+        monkeypatch.setattr(socket.SocketIO, 'readinto', timeout_idle_read)
         try:
+            with socket.create_connection(callback._address) as idle:
+                assert idle.recv(1) == b''
+            assert timed_out == [_CALLBACK_REQUEST_TIMEOUT_SECONDS]
+            assert not callback.received.is_set()
+            monkeypatch.setattr(callback.RequestHandlerClass, 'timeout', STALL_TIMEOUT_SECONDS)
             host, port = callback._address
-            response = requests.get(f'http://{host}:{port}/callback?code=ok', timeout=1)
+            response = requests.get(f'http://{host}:{port}/callback?code=ok')
             assert response.status_code == 200
-            callback._wait(1)
+            callback._thread.join()
+            assert callback.received.is_set()
         finally:
-            idle.close()
             callback._close()
 
     def test_malformed_callback_target_gets_plain_text_400(self) -> None:
         callback = userauth._CallbackServer()
         try:
-            with socket.create_connection(callback._address, timeout=2) as sock:
+            with socket.create_connection(callback._address) as sock:
                 sock.sendall(b'GET http://[ HTTP/1.1\r\nHost: x\r\n\r\n')
-                raw = sock.recv(4096)
-            assert raw.split(b' ', 2)[1] == b'400'
-            assert b'Content-Type: text/plain' in raw
+                with HTTPResponse(sock) as response:
+                    response.begin()
+                    assert response.status == 400
+                    content_type = response.getheader('Content-Type')
+                    assert content_type is not None
+                    assert content_type.partition(';')[0].strip().lower() == 'text/plain'
             assert not callback.received.is_set()
         finally:
             callback._close()
@@ -978,16 +1138,18 @@ class TestSignIn:
             {'error': 'invalid_request', 'error_description': 'client_secret is missing.'}
         ).encode()
         with pytest.raises(SignInError) as raised:
-            sign_in(
+            _sign_in(
                 'client-1',
                 authorization_endpoint=fake_provider.authorization_endpoint,
                 token_endpoint=fake_provider.token_endpoint,
                 open_browser=fake_provider.scripted_browser,
             )
-        assert str(raised.value) == (
-            'code exchange rejected (HTTP 400): invalid_request: client_secret is missing.; '
-            "set SG_USER_TOKEN_CLIENT_SECRET to the OAuth client's secret"
+        origin = fake_provider.token_endpoint.removesuffix('/token')
+        assert str(raised.value).startswith(
+            f'code exchange rejected (HTTP 400) at {origin}: invalid_request'
         )
+        assert 'SG_USER_TOKEN_CLIENT_SECRET' in str(raised.value)
+        assert 'client_secret is missing' not in str(raised.value)
 
     @pytest.mark.parametrize(
         'body',
@@ -997,7 +1159,7 @@ class TestSignIn:
     def test_missing_id_token_is_rejected(self, fake_provider: _FakeProvider, body: bytes) -> None:
         fake_provider.token_body_override = body
         with pytest.raises(SignInError, match='token endpoint returned no id_token'):
-            sign_in(
+            _sign_in(
                 'client-1',
                 authorization_endpoint=fake_provider.authorization_endpoint,
                 token_endpoint=fake_provider.token_endpoint,
@@ -1007,7 +1169,7 @@ class TestSignIn:
     def test_nonce_mismatch_is_rejected(self, fake_provider: _FakeProvider) -> None:
         fake_provider.wrong_nonce = True
         with pytest.raises(SignInError, match='nonce'):
-            sign_in(
+            _sign_in(
                 'client-1',
                 authorization_endpoint=fake_provider.authorization_endpoint,
                 token_endpoint=fake_provider.token_endpoint,
@@ -1015,141 +1177,111 @@ class TestSignIn:
             )
 
     def test_partial_callback_timeout_does_not_print_traceback(
-        self, capfd: pytest.CaptureFixture[str]
+        self,
+        capfd: pytest.CaptureFixture[str],
+        callback_reads: '_CallbackReads',
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        callback = userauth._CallbackServer()
-        client = socket.create_connection(callback._address, timeout=1)
-        try:
+        callback = callback_reads.callback
+        expired_wait = Mock(return_value=False)
+        monkeypatch.setattr(callback.received, 'wait', expired_wait)
+        with socket.create_connection(callback._address) as client:
             client.sendall(b'GET /callback?code=partial')
-            _wait_for_callback_read(callback)
+            callback_reads.next_read().set()
+            callback_reads.next_read()
+            callback_reads.observe_close(client)
             with pytest.raises(SignInError, match='timed out'):
-                callback._wait(0)
-            assert not callback._thread.is_alive()
+                callback._wait(userauth._SIGN_IN_TIMEOUT_SECONDS)
+            expired_wait.assert_called_once_with(userauth._SIGN_IN_TIMEOUT_SECONDS)
+            callback_reads.assert_closed_before_join()
             assert capfd.readouterr().err == ''
-        finally:
-            client.close()
-            callback._close()
 
     @pytest.mark.usefixtures('no_requests')
-    def test_provider_error_is_reported(self, browser: _Browser) -> None:
-        browser.authorization_error = ('access_denied', 'user cancelled')
-        with pytest.raises(SignInError, match=r'access_denied.*user cancelled'):
-            sign_in(
+    @pytest.mark.parametrize('code', ['access_denied', 'unknown-private-value'])
+    def test_provider_refusal_keeps_only_recognized_code(
+        self, browser: _Browser, code: str
+    ) -> None:
+        browser.authorization_error = (code, 'private provider description')
+        with pytest.raises(SignInError) as caught:
+            _sign_in(
                 'client-1',
                 authorization_endpoint=browser.authorization_endpoint,
                 token_endpoint=_PROVIDER_ENDPOINT,
                 open_browser=browser.scripted_browser,
             )
+        expected = 'authorization request rejected at https://idp.example'
+        if code == 'access_denied':
+            expected += ': access_denied: authorize the application to sign in'
+        assert str(caught.value) == expected
 
     def test_queued_partial_callback_cannot_race_shutdown(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        entered_get_request = threading.Event()
-        release_get_request = threading.Event()
-        original_get_request = HTTPServer.get_request
+        callback = _StoppedCallback()
+        callback._thread.join()
+        request, client = socket.socketpair()
 
-        def delayed_get_request(server: HTTPServer) -> tuple[socket.socket, object]:
-            entered_get_request.set()
-            assert release_get_request.wait(timeout=1)
-            return original_get_request(server)
+        original_accept = HTTPServer.get_request
 
-        monkeypatch.setattr(HTTPServer, 'get_request', delayed_get_request)
-        callback = userauth._CallbackServer()
-        original_create_connection = socket.create_connection
-        client = original_create_connection(callback._address, timeout=1)
-        client.sendall(b'GET /oauth/callback?code=partial')
-        assert entered_get_request.wait(timeout=1)
-        wakeup_queued = threading.Event()
+        def accept_after_close(server: HTTPServer) -> tuple[socket.socket, object]:
+            if server is not callback:
+                return original_accept(server)
+            # Closing wins the race between accept() and registering ownership.
+            callback._begin_close()
+            return request, ('127.0.0.1', 0)
 
-        def observed_create_connection(address: tuple[str, int], timeout: float) -> socket.socket:
-            connection = original_create_connection(address, timeout)
-            wakeup_queued.set()
-            return connection
-
-        monkeypatch.setattr(socket, 'create_connection', observed_create_connection)
-        closed = threading.Event()
-
-        def close_callback() -> None:
-            callback._close()
-            closed.set()
-
-        closer = threading.Thread(target=close_callback, daemon=True)
-        closer.start()
-        assert wakeup_queued.wait(timeout=1)
-        release_get_request.set()
+        monkeypatch.setattr(HTTPServer, 'get_request', accept_after_close)
         try:
-            assert closed.wait(timeout=1)
+            with pytest.raises(OSError, match='callback server is closing'):
+                callback.get_request()
+            assert request.fileno() == -1
+            assert callback._active_request is None
+            assert client.recv(1) == b''
         finally:
+            request.close()
             client.close()
-            release_get_request.set()
-            closer.join(timeout=2)
-        assert not closer.is_alive()
-        assert not callback._thread.is_alive()
+            callback._close()
 
     @pytest.mark.usefixtures('no_requests')
     def test_state_mismatch_is_rejected(self, browser: _Browser) -> None:
         browser.tamper_state = True
         with pytest.raises(SignInError, match='state'):
-            sign_in(
+            _sign_in(
                 'client-1',
                 authorization_endpoint=browser.authorization_endpoint,
                 token_endpoint=_PROVIDER_ENDPOINT,
                 open_browser=browser.scripted_browser,
             )
 
-    def test_trickled_partial_callback_cannot_block_shutdown(self) -> None:
-        callback = userauth._CallbackServer()
-        client = socket.create_connection(callback._address, timeout=1)
-        client.sendall(b'GET /oauth/callback?code=partial')
-        stop = threading.Event()
-        trickled = threading.Event()
-
-        def trickle_request() -> None:
-            while not stop.wait(0.05):
-                try:
-                    client.sendall(b'x')
-                except OSError:
-                    return
-                trickled.set()
-
-        dripper = threading.Thread(target=trickle_request, daemon=True)
-        dripper.start()
-        closed = threading.Event()
-
-        def close_callback() -> None:
+    def test_trickled_partial_callback_cannot_block_shutdown(
+        self, callback_reads: '_CallbackReads'
+    ) -> None:
+        callback = callback_reads.callback
+        with socket.create_connection(callback._address) as client:
+            # Deliver each chunk only after the handler reaches the next read.
+            # There is no gap whose duration determines whether shutdown works.
+            client.sendall(b'GET /oauth/callback?code=partial')
+            callback_reads.next_read().set()
+            gate = callback_reads.next_read()
+            client.sendall(b'x')
+            gate.set()
+            callback_reads.next_read()
+            callback_reads.observe_close(client)
             callback._close()
-            closed.set()
-
-        closer = threading.Thread(target=close_callback, daemon=True)
-        try:
-            assert trickled.wait(timeout=1)
-            _wait_for_callback_read(callback)
-            closer.start()
-            assert closed.wait(timeout=1)
-            assert not callback._thread.is_alive()
-        finally:
-            stop.set()
-            client.close()
-            dripper.join(timeout=2)
-            if closer.ident is not None:
-                closer.join(timeout=2)
-            callback._close()
-        assert not dripper.is_alive()
-        assert not closer.is_alive()
-        assert not callback._thread.is_alive()
+            callback_reads.assert_closed_before_join()
 
     def test_unrelated_request_does_not_consume_callback_listener(self) -> None:
         callback = userauth._CallbackServer()
         try:
             host, port = callback._address
-            wrong = requests.get(f'http://{host}:{port}/favicon.ico', timeout=1)
+            wrong = requests.get(f'http://{host}:{port}/favicon.ico')
             assert wrong.status_code == 404
             valid = requests.get(
                 f'http://{host}:{port}/callback?code=ok&state=expected',
-                timeout=1,
             )
             assert valid.status_code == 200
-            callback._wait(1)
+            callback._thread.join()
+            assert callback.received.is_set()
         finally:
             callback._close()
 
@@ -1160,18 +1292,19 @@ class TestSignIn:
         request, peer = socket.socketpair()
         reader = request.makefile('rb')
         descriptor = request.fileno()
-        shutdown = request.shutdown
+        shutdown = socket.socket.shutdown
         native_close = socket.close
         disposed: list[int] = []
         both_closers_entered = threading.Barrier(2)
 
         def concurrent_shutdown(sock: socket.socket, how: int) -> None:
-            assert sock is request
-            both_closers_entered.wait(timeout=5)
-            shutdown(how)
+            if sock is request:
+                both_closers_entered.wait()
+            shutdown(sock, how)
 
         def observed_close(file_descriptor: int) -> None:
-            disposed.append(file_descriptor)
+            if file_descriptor == descriptor:
+                disposed.append(file_descriptor)
             native_close(file_descriptor)
 
         try:
@@ -1185,7 +1318,7 @@ class TestSignIn:
                             for _ in range(2)
                         ]
                         for closer in closers:
-                            closer.result(timeout=5)
+                            closer.result()
                 assert request.fileno() == -1, (
                     'close deferred disposal until buffered reader close'
                 )
@@ -1199,27 +1332,40 @@ class TestSignIn:
             peer.close()
 
 
+class _StoppedCallback(userauth._CallbackServer):
+    def _serve_until_callback(self) -> None:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _callback_stall_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_init = userauth._CallbackServer.__init__
+
+    def initialize(
+        callback: userauth._CallbackServer, *, join_timeout: float = STALL_TIMEOUT_SECONDS
+    ) -> None:
+        original_init(callback, join_timeout=join_timeout)
+
+    monkeypatch.setattr(userauth._CallbackServer, '__init__', initialize)
+    monkeypatch.setattr(userauth, '_REQUEST_TIMEOUT_SECONDS', STALL_TIMEOUT_SECONDS)
+    monkeypatch.setattr(userauth, '_WAKEUP_TIMEOUT_SECONDS', STALL_TIMEOUT_SECONDS)
+
+
 def _id_token(payload: dict[str, object]) -> str:
     encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
     return f'e30.{encoded}.x'
 
 
-def _wait_for_callback_read(callback: userauth._CallbackServer) -> None:
-    # Acceptance alone does not prove the handler reached its buffered reader.
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        frame = sys._current_frames().get(callback._thread.ident or -1)
-        while frame is not None:
-            if frame.f_code is socket.SocketIO.readinto.__code__:
-                reader = frame.f_locals.get('self')
-                request = callback._active_request
-                assert isinstance(reader, socket.SocketIO)
-                assert request is not None
-                assert reader.fileno() == request.fileno()
-                return
-            frame = frame.f_back
-        time.sleep(0.001)
-    pytest.fail('callback did not reach its buffered socket read')
+@pytest.fixture
+def callback_reads(monkeypatch: pytest.MonkeyPatch) -> Iterator[_CallbackReads]:
+    reads = _CallbackReads(monkeypatch)
+    try:
+        yield reads
+    finally:
+        reads.release()
+        reads.callback._close()
+        reads.callback._thread.join()
+        assert not reads.errors
 
 
 @pytest.fixture
@@ -1243,7 +1389,7 @@ def fake_provider() -> Iterator[_FakeProvider]:
     ('site', 'message'),
     [
         ('discovery', 'OIDC discovery for https://127.0.0.1:1 could not be sent: '),
-        ('token', 'token endpoint request could not be sent: '),
+        ('token', 'test at https://127.0.0.1:1 could not be sent: '),
     ],
 )
 def test_missing_ca_bundle_is_a_setup_error(
@@ -1268,7 +1414,96 @@ def test_missing_ca_bundle_is_a_setup_error(
     )
     with pytest.raises(SignInError) as caught:
         send()
-    assert isinstance(caught.value.__cause__, OSError)
-    assert not isinstance(caught.value.__cause__, requests.RequestException)
-    assert str(caught.value) == message + str(caught.value.__cause__)
+    assert caught.value.__suppress_context__
+    assert str(caught.value).startswith(message)
     assert str(missing) in str(caught.value)
+
+
+@pytest.mark.parametrize('mode', ['transport', 'mismatch', 'refusal'])
+def test_discovery_diagnosis_uses_only_the_issuer_origin(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    issuer = 'https://issuer.example/tenant?key=query-marker#fragment'
+    monkeypatch.setenv('SG_USER_TOKEN_ISSUER', issuer)
+    monkeypatch.setenv('SG_USER_TOKEN_CLIENT_ID', 'client')
+    body = (
+        {'issuer': 'provider-private-value'}
+        if mode == 'mismatch'
+        else {
+            'error': 'invalid_request',
+            'error_description': 'tenant refused query-marker ' + 'x' * 300,
+        }
+    )
+    response = Mock(status_code=200 if mode == 'mismatch' else 400, json=Mock(return_value=body))
+    monkeypatch.setattr(
+        requests,
+        'get',
+        Mock(
+            return_value=response,
+            side_effect=requests.ConnectionError(issuer) if mode == 'transport' else None,
+        ),
+    )
+    with pytest.raises(SignInError) as caught:
+        identity_settings()
+    message = str(caught.value)
+    assert 'https://issuer.example' in message
+    assert all(part not in message for part in ('private', 'query-marker', 'fragment'))
+    assert 'query-marker' not in ''.join(traceback.format_exception(caught.value))
+    if mode == 'transport':
+        assert 'discovery' in message
+    if mode == 'refusal':
+        assert '400' in message
+        assert 'invalid_request' in message
+        assert 'tenant refused' not in message
+        assert 'x' * 121 not in message
+
+
+@pytest.mark.parametrize('code', ['invalid_client', 'opaque-provider-marker'])
+def test_client_id_keeps_recognized_code_and_secret_hint(code: str) -> None:
+    response = Mock(
+        status_code=401,
+        json=Mock(
+            return_value={
+                'error': code,
+                'error_description': 'provider-marker client_secret is missing',
+            }
+        ),
+    )
+    with pytest.raises(SignInError) as caught:
+        userauth._post_token_endpoint(
+            Mock(post=Mock(return_value=response)),
+            _PROVIDER_ENDPOINT,
+            {'client_id': 'client'},
+            operation='code exchange',
+        )
+    message = str(caught.value)
+    assert 'HTTP 401' in message
+    assert 'provider-marker' not in message
+    if code == 'invalid_client':
+        assert 'invalid_client' in message
+        assert 'SG_USER_TOKEN_CLIENT_SECRET' in message
+
+
+@pytest.mark.parametrize(
+    ('code', 'hint'),
+    [
+        ('invalid_scope', 'scopes allowed'),
+        ('server_error', 'check the identity provider'),
+        ('temporarily_unavailable', 'try the identity provider again'),
+        ('unauthorized_client', 'enable this grant'),
+        ('unsupported_grant_type', 'grant types enabled'),
+        ('unsupported_response_type', 'authorization code flow'),
+    ],
+)
+def test_recognized_oauth_refusals_explain_repair(code: str, hint: str) -> None:
+    response = Mock(
+        status_code=400,
+        json=Mock(return_value={'error': code, 'error_description': 'private-text'}),
+    )
+    with pytest.raises(SignInError) as caught:
+        userauth._post_token_endpoint(
+            Mock(post=Mock(return_value=response)), _PROVIDER_ENDPOINT, {}, operation='refresh'
+        )
+    assert code in str(caught.value)
+    assert hint in str(caught.value)
+    assert 'private-text' not in str(caught.value)

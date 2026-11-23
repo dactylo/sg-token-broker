@@ -1,0 +1,9 @@
+{
+  "version": "0.1.0",
+  "files": {
+    "src/sg_token_broker/_vendor/strictargs/__init__.py": "f9246dc7db4db42640e20627649f50a6e012812ff0bef5ad595264da32ac4c34",
+    "src/sg_token_broker/_vendor/strictargs/_parser.py": "538fea2cb3de4cf26dbd07694a27e73d56b2364857b0dac7a10e1d29f962a4a2",
+    "tests/strictargs/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tests/strictargs/test_parser.py": "1478f7dd06301ec927c249b065de90c5a6661fd69ecd5c680e2a5a88a363b156"
+  }
+}
